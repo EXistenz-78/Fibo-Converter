@@ -28,3 +28,12 @@ also in DT Hub's `Tools/atelier-fork-patches/`. The tools are copied into the ap
 
 Not tried on the real 25 GB of files yet: the steps were run by hand with the same tools (conversion, text encoder, i8x), but
 the merge step and the full app run have only been tested with small synthetic files.
+
+## Third-party tools
+
+The released app bundles `ModelConverter` and `QuantI8x`, built from the GPL-3.0 Draw Things engine.
+Source, base commit and patch: see [NOTICE.md](NOTICE.md).
+
+## Installing the release
+
+The app is signed ad hoc, not notarized. After downloading the zip, unzip it, then right-click the app, choose Open, and confirm once.
