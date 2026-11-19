@@ -26,9 +26,6 @@ The conversion tools are built from the Draw Things fork checkout (`FORK`, defau
 `fibo-tools`: SwiftPM targets `ModelConverter` and `QuantI8x`, an i8x variant of the fork's `ModelQuantizer`). The patch is
 also in DT Hub's `Tools/atelier-fork-patches/`. The tools are copied into the app (`Contents/Helpers`).
 
-Not tried on the real 25 GB of files yet: the steps were run by hand with the same tools (conversion, text encoder, i8x), but
-the merge step and the full app run have only been tested with small synthetic files.
-
 ## Third-party tools
 
 The released app bundles `ModelConverter` and `QuantI8x`, built from the GPL-3.0 Draw Things engine.
