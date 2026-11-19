@@ -4,8 +4,6 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
   @State private var model = ConverterModel()
-  @State private var pickingSource = false
-  @State private var pickingModels = false
 
   var body: some View {
     ScrollView {
@@ -16,12 +14,6 @@ struct ContentView: View {
         runBox
       }
       .padding(20)
-    }
-    .fileImporter(isPresented: $pickingSource, allowedContentTypes: [.folder]) { result in
-      if case .success(let url) = result { model.sourceFolder = url }
-    }
-    .fileImporter(isPresented: $pickingModels, allowedContentTypes: [.folder]) { result in
-      if case .success(let url) = result { model.modelsFolder = url }
     }
   }
 
@@ -69,7 +61,7 @@ struct ContentView: View {
         Divider()
         folderRow(
           "Folder with the downloaded files", model.sourceFolder,
-          action: { pickingSource = true }, extra: ("Check again", { model.rescan() }))
+          action: { chooseFolder(model.sourceFolder) { model.sourceFolder = $0 } }, extra: ("Check again", { model.rescan() }))
         if !model.allFilesFound {
           Text("Files still missing or not fully downloaded (the size must match exactly).")
             .font(.caption).foregroundStyle(.orange)
@@ -84,7 +76,7 @@ struct ContentView: View {
   private var outputBox: some View {
     GroupBox {
       VStack(alignment: .leading, spacing: 10) {
-        folderRow("Models folder (your Draw Things / Atelier / DT Hub folder)", model.modelsFolder, action: { pickingModels = true }, extra: nil)
+        folderRow("Models folder (your Draw Things / Atelier / DT Hub folder)", model.modelsFolder, action: { chooseFolder(model.modelsFolder) { model.modelsFolder = $0 } }, extra: nil)
         Picker("Result", selection: $model.precision) {
           Text("8-bit S (i8x): about 13 GB, recommended").tag(Precision.eightBitS)
           Text("Full precision (f16): about 25 GB").tag(Precision.full)
@@ -173,6 +165,16 @@ struct ContentView: View {
         if let extra { Button(extra.0, action: extra.1) }
       }
     }
+  }
+
+  private func chooseFolder(_ current: URL?, _ apply: (URL) -> Void) {
+    let panel = NSOpenPanel()
+    panel.canChooseDirectories = true
+    panel.canChooseFiles = false
+    panel.canCreateDirectories = true
+    panel.allowsMultipleSelection = false
+    panel.directoryURL = current
+    if panel.runModal() == .OK, let url = panel.url { apply(url) }
   }
 
   private static func size(_ bytes: Int64) -> String {
