@@ -1,0 +1,1 @@
+FiboConverterApp.main()
