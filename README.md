@@ -1,4 +1,4 @@
-# Fibo Converter
+# Model Converter
 
 A small macOS app with three tabs that turns model files into models Draw Things, Atelier and DT Hub can run, and
 registers them in the models folder's `custom.json`:
@@ -29,7 +29,7 @@ With 8-bit S only, the full-precision intermediates are moved to the Trash. `cus
 
 ## Build
 ```bash
-Scripts/build-app.sh      # writes build/Fibo Converter.app
+Scripts/build-app.sh      # writes build/Model Converter.app
 swift test                # merge, custom.json and pipeline (with stand-in tools)
 ```
 The conversion tools are built from the Draw Things fork checkout (`FORK`, default `~/Developer-krea2/fork`, branch

@@ -1,6 +1,6 @@
 # Third-party software
 
-`Fibo Converter.app` bundles two command-line tools in `Contents/Helpers`:
+`Model Converter.app` bundles two command-line tools in `Contents/Helpers`:
 `ModelConverter` and `QuantI8x`. Both are built from the Draw Things community engine
 (<https://github.com/drawthingsai/draw-things-community>, GPL-3.0), using the
 `krea2-edit` branch of <https://github.com/ianiv/draw-things-community> at commit

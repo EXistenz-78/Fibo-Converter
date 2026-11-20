@@ -1,10 +1,10 @@
 #!/bin/bash
-# Builds "Fibo Converter.app" in build/. The conversion tools come from the Draw Things fork
+# Builds "Model Converter.app" in build/. The conversion tools come from the Draw Things fork
 # (branch fibo-tools, see README): FORK=/path/to/fork builds them if they are missing.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 FORK="${FORK:-$HOME/Developer-krea2/fork}"
-APP="build/Fibo Converter.app"
+APP="build/Model Converter.app"
 
 for tool in ModelConverter QuantI8x; do
   if [ ! -x "$FORK/.build/release/$tool" ]; then
@@ -23,7 +23,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <plist version="1.0"><dict>
 <key>CFBundleExecutable</key><string>FiboConverter</string>
 <key>CFBundleIdentifier</key><string>com.exiztenz.fibo-converter</string>
-<key>CFBundleName</key><string>Fibo Converter</string>
+<key>CFBundleName</key><string>Model Converter</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>1.2</string>
 <key>CFBundleVersion</key><string>1</string>
