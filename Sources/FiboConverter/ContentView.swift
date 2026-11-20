@@ -2,7 +2,7 @@ import FiboCore
 import SwiftUI
 import UniformTypeIdentifiers
 
-struct ContentView: View {
+struct FiboView: View {
   @State private var model = ConverterModel()
 
   var body: some View {
@@ -179,5 +179,16 @@ struct ContentView: View {
 
   private static func size(_ bytes: Int64) -> String {
     ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+  }
+}
+
+struct ContentView: View {
+  var body: some View {
+    TabView {
+      FiboView().tabItem { Text("Fibo 2.0 Edit Turbo") }
+      GenericView().tabItem { Text("Any safetensors") }
+      H3View().tabItem { Text("MiniMax H3 Image") }
+    }
+    .padding(.top, 8)
   }
 }

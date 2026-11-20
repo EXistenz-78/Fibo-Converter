@@ -1,0 +1,43 @@
+From 1bef40c2f8971931220b99c50242e32962c7d504 Mon Sep 17 00:00:00 2001
+From: Antonio D'Achille <existenz70@gmail.com>
+Date: Fri, 20 Nov 2026 10:50:31 +0100
+Subject: [PATCH 2/2] QuantI8x: MiniMax H3 Image 8-bit S rule (as Atelier /
+ Draw Things' own i8x files)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ Apps/QuantI8x/Quantizer.swift | 18 +++++++++++++++++-
+ 1 file changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/Apps/QuantI8x/Quantizer.swift b/Apps/QuantI8x/Quantizer.swift
+index a68237d..36479d7 100644
+--- a/Apps/QuantI8x/Quantizer.swift
++++ b/Apps/QuantI8x/Quantizer.swift
+@@ -299,7 +299,23 @@ struct Quantizer: ParsableCommand {
+               }
+             }
+           case .minimaxH3Image:
+-            $0.write(key, tensor: fp16)
++            // As Draw Things' own minimax_h3_*_i8x.ckpt files (and Atelier) store them: block
++            // linears row-wise 8-bit, AdaLN matrices palettized (kept FP16 when small), the token
++            // refiner, embedders and output projections FP16, vectors ezm7, FP32 as they are.
++            let isSmallAdaLN =
++              (key.contains("adaln") || key.contains("norm_out")) && shape.reduce(1, *) < 1 << 20
++            let keepsFP16 =
++              ["refiner", "embedder", "proj_out"].contains { key.contains($0) } || isSmallAdaLN
++            if tensor.dataType == .Float32 {
++              $0.write(key, tensor: tensor)
++            } else if keepsFP16 {
++              $0.write(key, tensor: fp16)
++            } else if squeezedDims > 1 {
++              $0.write(
++                key, tensor: fp16, codec: key.contains("adaln") ? [.q8p, .ezm7] : [.i8x, .ezm7])
++            } else {
++              $0.write(key, tensor: fp16, codec: .ezm7)
++            }
+           case .fibo2:
+             // Embedders, the final projection, gist queries and gates stay in FP16.
+             if key.contains("embedder") || key.contains("final_linear")
+-- 
+2.54.0 (Apple Git-157)
+

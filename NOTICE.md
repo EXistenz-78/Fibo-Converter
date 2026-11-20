@@ -4,10 +4,11 @@
 `ModelConverter` and `QuantI8x`. Both are built from the Draw Things community engine
 (<https://github.com/drawthingsai/draw-things-community>, GPL-3.0), using the
 `krea2-edit` branch of <https://github.com/ianiv/draw-things-community> at commit
-`a76e42b` plus the patch in `Third-party/0001-SwiftPM-targets-for-ModelConverter-and-an-i8x-8-bit-.patch`
-(adds SwiftPM targets for `ModelConverter` and for `QuantI8x`, an i8x/8-bit S variant of the upstream quantizer).
+`a76e42b` plus the two patches in `Third-party/` (apply in order): `0001` adds SwiftPM targets for `ModelConverter` and for
+`QuantI8x`, an i8x/8-bit S variant of the upstream quantizer; `0002` adds the MiniMax H3 Image rule to it (following
+Atelier's `MOSSImporter.quantize`, <https://github.com/ianiv/Atelier>, GPL-3.0).
 
 That is the complete corresponding source for the bundled binaries: check out that commit,
-apply the patch, and run `swift build -c release --product ModelConverter --product QuantI8x`.
+apply the patches, and run `swift build -c release --product ModelConverter --product QuantI8x`.
 The engine is licensed under the GNU GPL v3 (<https://www.gnu.org/licenses/gpl-3.0.html>).
 The tools run as separate processes; the app's own code in `Sources/` is independent of them.

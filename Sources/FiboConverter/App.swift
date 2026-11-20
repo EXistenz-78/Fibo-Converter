@@ -2,7 +2,7 @@ import SwiftUI
 
 struct FiboConverterApp: App {
   var body: some Scene {
-    WindowGroup("Fibo 2.0 Converter") {
+    WindowGroup("Fibo Converter") {
       ContentView()
         .frame(minWidth: 720, minHeight: 640)
     }

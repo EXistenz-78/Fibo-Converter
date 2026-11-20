@@ -10,7 +10,10 @@ enum StepState: Equatable {
 @MainActor @Observable
 final class ConverterModel {
   var sourceFolder: URL? { didSet { rescan(); save("sourceFolder", sourceFolder) } }
-  var modelsFolder: URL? { didSet { updateSpace(); save("modelsFolder", modelsFolder) } }
+  var modelsFolder: URL? {
+    get { Settings.shared.modelsFolder }
+    set { Settings.shared.modelsFolder = newValue }
+  }
   var precision: Precision = .eightBitS
   var licenseAccepted = false
   private(set) var located = [RequiredFile: URL]()
@@ -20,19 +23,17 @@ final class ConverterModel {
   private(set) var isRunning = false
   private(set) var message: String?
   private(set) var failed = false
-  private(set) var freeBytes: Int64?
+  var freeBytes: Int64? { Settings.shared.freeBytes }
 
   private var pipeline: Pipeline?
   private var activity: NSObjectProtocol?
 
   init() {
     sourceFolder = Self.load("sourceFolder")
-    modelsFolder = Self.load("modelsFolder")
     if sourceFolder == nil {
       sourceFolder = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
     }
     rescan()
-    updateSpace()
   }
 
   // MARK: Checks
@@ -53,29 +54,11 @@ final class ConverterModel {
       && helpersFolder != nil
   }
 
-  var helpersFolder: URL? {
-    var candidates = [Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers")]
-    if let override = ProcessInfo.processInfo.environment["FIBO_HELPERS"] {
-      candidates.insert(URL(fileURLWithPath: override), at: 0)
-    }
-    return candidates.first {
-      FileManager.default.isExecutableFile(atPath: $0.appendingPathComponent("ModelConverter").path)
-        && FileManager.default.isExecutableFile(atPath: $0.appendingPathComponent("QuantI8x").path)
-    }
-  }
+  var helpersFolder: URL? { Settings.helpersFolder }
 
   func rescan() {
     guard let sourceFolder else { located = [:]; return }
     located = FiboSources.locate(in: sourceFolder)
-  }
-
-  func updateSpace() {
-    guard let modelsFolder,
-      let values = try? modelsFolder.resourceValues(forKeys: [
-        .volumeAvailableCapacityForImportantUsageKey
-      ])
-    else { freeBytes = nil; return }
-    freeBytes = values.volumeAvailableCapacityForImportantUsage
   }
 
   // MARK: Run
@@ -119,7 +102,6 @@ final class ConverterModel {
       isRunning = false
       if let activity { ProcessInfo.processInfo.endActivity(activity) }
       activity = nil
-      updateSpace()
     }
   }
 

@@ -2,15 +2,22 @@ import Foundation
 
 /// The three files of briaai/Fibo-2.0-edit-turbo the converter needs. Browsers save them flat in
 /// Downloads, so they are recognised by name and exact size, wherever they sit under the folder.
-public struct RequiredFile: Identifiable, Hashable {
-  public var id: String { path }
+public struct RequiredFile: Identifiable, Hashable, Sendable {
+  public var id: String { repository + "/" + path }
+  /// Hugging Face repository, "owner/name".
+  public var repository: String
   /// Path inside the Hugging Face repository.
   public var path: String
   public var size: Int64
   public var name: String { (path as NSString).lastPathComponent }
   public var folder: String { (path as NSString).deletingLastPathComponent }
   public var url: URL {
-    URL(string: "https://huggingface.co/briaai/Fibo-2.0-edit-turbo/resolve/main/\(path)?download=true")!
+    URL(string: "https://huggingface.co/\(repository)/resolve/main/\(path)?download=true")!
+  }
+  public init(repository: String = "briaai/Fibo-2.0-edit-turbo", path: String, size: Int64) {
+    self.repository = repository
+    self.path = path
+    self.size = size
   }
 }
 
@@ -28,6 +35,12 @@ public enum FiboSources {
 
   /// Looks for each required file under `folder` (three levels deep). Missing files map to nil.
   public static func locate(in folder: URL) -> [RequiredFile: URL] {
+    locate(all, in: folder)
+  }
+
+  /// Looks for the given files under `folder`.
+  public static func locate(_ files: [RequiredFile], in folder: URL) -> [RequiredFile: URL] {
+    let all = files
     var found = [RequiredFile: URL]()
     let manager = FileManager.default
     guard
@@ -47,7 +60,7 @@ public enum FiboSources {
   }
 }
 
-public enum Precision: String, CaseIterable, Identifiable {
+public enum Precision: String, CaseIterable, Identifiable, Sendable {
   case eightBitS, full, both
   public var id: String { rawValue }
   public var makesI8x: Bool { self != .full }
