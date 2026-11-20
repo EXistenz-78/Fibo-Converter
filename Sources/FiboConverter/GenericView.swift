@@ -7,6 +7,7 @@ final class GenericModel {
   var name = ""
   var needsPrep = false
   var convertTextEncoders = false
+  var allowFetch = false
   let run = RunController()
 
   func setInput(_ url: URL) {
@@ -29,7 +30,7 @@ final class GenericModel {
   var neededBytes: Int64 { inputSize * (needsPrep ? 3 : 2) + 2_000_000_000 }
   var canStart: Bool {
     input != nil && !name.trimmingCharacters(in: .whitespaces).isEmpty && settings.modelsFolder != nil
-      && Settings.helpersFolder != nil && !run.isRunning && (!needsPrep || settings.prepScript != nil)
+      && Settings.helpersFolder != nil && !run.isRunning && (!needsPrep || settings.effectivePrepScript != nil)
       && (settings.freeBytes.map { $0 > neededBytes } ?? true)
   }
 
@@ -39,8 +40,8 @@ final class GenericModel {
     let work = models.appendingPathComponent("_generic-work")
     let job = GenericJob(
       input: input, name: name.trimmingCharacters(in: .whitespaces), models: models, work: work,
-      helpers: helpers, prepScript: needsPrep ? settings.prepScript : nil,
-      convertTextEncoders: convertTextEncoders)
+      helpers: helpers, prepScript: needsPrep ? settings.effectivePrepScript : nil,
+      convertTextEncoders: convertTextEncoders, allowFetch: allowFetch)
     run.start(
       reason: "Converting a model", work: work, steps: GenericConversion.steps(job),
       success: "Done. Refresh the models list in your app to see \(job.name).")
@@ -80,11 +81,15 @@ struct GenericView: View {
               isOn: $model.needsPrep)
             if model.needsPrep {
               PathRow(
-                title: "prep-model.py", url: settings.prepScript,
-                placeholder: "Choose your copy of prep-model.py",
-                choose: { chooseFile(settings.prepScript, extensions: ["py"]) { settings.prepScript = $0 } })
+                title: "prep-model.py (by teaspan)", url: settings.effectivePrepScript,
+                placeholder: "Not found: choose a copy of prep-model.py",
+                choose: { chooseFile(settings.prepScript, extensions: ["py"]) { settings.prepScript = $0 } },
+                extra: settings.prepScript == nil ? nil : ("Use the bundled one", { settings.prepScript = nil }))
+              Toggle(
+                "Let prep-model.py download a few tensors (63 MB) when a pruned MiniMax H3 file needs them",
+                isOn: $model.allowFetch)
               Text(
-                "This script is not part of the app. It needs Python 3 with numpy (python3 -m pip install numpy). It writes a dequantized copy first, so about three times the file's size is needed while converting."
+                "Needs Python 3 with numpy (python3 -m pip install numpy). It writes a dequantized copy first, so about three times the file's size is needed while converting."
               )
               .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }

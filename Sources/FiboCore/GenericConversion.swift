@@ -13,10 +13,13 @@ public struct GenericJob: Sendable {
   /// Python interpreters to try for prep-model.py (the first with numpy is used).
   public var pythonCandidates: [URL]
   public var convertTextEncoders: Bool
+  /// Lets prep-model.py download the few tensors it may need (pruned MiniMax H3 only).
+  public var allowFetch: Bool
 
   public init(
     input: URL, name: String, models: URL, work: URL, helpers: URL, prepScript: URL? = nil,
-    pythonCandidates: [URL] = GenericConversion.defaultPythons, convertTextEncoders: Bool = false
+    pythonCandidates: [URL] = GenericConversion.defaultPythons, convertTextEncoders: Bool = false,
+    allowFetch: Bool = false
   ) {
     self.input = input
     self.name = name
@@ -26,6 +29,7 @@ public struct GenericJob: Sendable {
     self.prepScript = prepScript
     self.pythonCandidates = pythonCandidates
     self.convertTextEncoders = convertTextEncoders
+    self.allowFetch = allowFetch
   }
 }
 
@@ -77,8 +81,9 @@ public enum GenericConversion {
           }
           try? FileManager.default.removeItem(at: preparedDirectory)
           try FileManager.default.createDirectory(at: preparedDirectory, withIntermediateDirectories: true)
-          try await context.exec(
-            python, [script.path, job.input.path, preparedDirectory.path + "/"])
+          var arguments = [script.path, job.input.path, preparedDirectory.path + "/"]
+          if !job.allowFetch { arguments.append("--no-fetch") }
+          try await context.exec(python, arguments)
         })
     }
     steps.append(

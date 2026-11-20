@@ -15,6 +15,7 @@ swift build -c release
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Helpers" "$APP/Contents/Resources"
 cp .build/release/FiboConverter "$APP/Contents/MacOS/"
+cp Resources/prep-model.py "$APP/Contents/Resources/"
 cp "$FORK/.build/release/ModelConverter" "$FORK/.build/release/QuantI8x" "$APP/Contents/Helpers/"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -24,7 +25,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <key>CFBundleIdentifier</key><string>com.exiztenz.fibo-converter</string>
 <key>CFBundleName</key><string>Fibo Converter</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.1</string>
+<key>CFBundleShortVersionString</key><string>1.2</string>
 <key>CFBundleVersion</key><string>1</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSHighResolutionCapable</key><true/>

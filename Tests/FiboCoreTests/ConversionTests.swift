@@ -169,3 +169,47 @@ final class ConversionTests: XCTestCase {
     XCTAssertEqual(Set(H3Sources.all.map(\.id)).count, 3)
   }
 }
+
+final class PrepFetchTests: XCTestCase {
+  func testPrepIsToldNotToFetchUnlessAllowed() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("prep-\(UUID().uuidString)")
+    let models = root.appendingPathComponent("models"), helpers = root.appendingPathComponent("h")
+    for url in [models, helpers] { try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true) }
+    defer { try? FileManager.default.removeItem(at: root) }
+    func script(_ name: String, _ body: String, in folder: URL) throws -> URL {
+      let url = folder.appendingPathComponent(name)
+      try ("#!/bin/bash\n" + body).write(to: url, atomically: true, encoding: .utf8)
+      try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+      return url
+    }
+    _ = try script("ModelConverter", """
+      while [ $# -gt 0 ]; do case "$1" in -n) n="$2"; shift 2;; -o) o="$2"; shift 2;; *) shift;; esac; done
+      echo data > "$o/${n}_f16.ckpt"
+      printf '{\\n  "file" : "%s_f16.ckpt"\\n}\\n' "$n"
+      """, in: helpers)
+    let python = try script("python3", """
+      if [ "$1" = "-c" ]; then exit 0; fi
+      echo "ARGS: $*"; echo data > "$3/x-DT.safetensors"
+      """, in: root)
+    let prep = root.appendingPathComponent("prep-model.py")
+    try "x".write(to: prep, atomically: true, encoding: .utf8)
+    let input = root.appendingPathComponent("in.safetensors"); try Data([1]).write(to: input)
+    for allow in [false, true] {
+      let log = LogBox()
+      let job = GenericJob(
+        input: input, name: "m\(allow)", models: models, work: root.appendingPathComponent("w\(allow)"),
+        helpers: helpers, prepScript: prep, pythonCandidates: [python], allowFetch: allow)
+      try await WorkRunner().run(GenericConversion.steps(job), work: job.work) {
+        if case .log(let line) = $0 { log.add(line) }
+      }
+      XCTAssertEqual(log.lines.contains { $0.hasPrefix("ARGS:") && $0.contains("--no-fetch") }, !allow)
+    }
+  }
+}
+
+private final class LogBox: @unchecked Sendable {
+  private let lock = NSLock()
+  private var all = [String]()
+  func add(_ line: String) { lock.withLock { all.append(line) } }
+  var lines: [String] { lock.withLock { all } }
+}

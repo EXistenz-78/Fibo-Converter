@@ -14,6 +14,10 @@ final class Settings {
   var prepScript: URL? {
     didSet { UserDefaults.standard.set(prepScript?.path, forKey: "prepScript") }
   }
+  /// The prep-model.py bundled with the app (by teaspan), unless another copy was chosen.
+  var effectivePrepScript: URL? { prepScript ?? Settings.bundledPrepScript }
+  static var bundledPrepScript: URL? { Bundle.main.url(forResource: "prep-model", withExtension: "py") }
+
   private init() {
     modelsFolder = UserDefaults.standard.string(forKey: "modelsFolder").map { URL(fileURLWithPath: $0) }
     prepScript = UserDefaults.standard.string(forKey: "prepScript").map { URL(fileURLWithPath: $0) }
