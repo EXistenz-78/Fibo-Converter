@@ -168,6 +168,68 @@ final class ConversionTests: XCTestCase {
     XCTAssertEqual(H3Sources.textEncoder.name, "qwen_3_vl_32b_50_i8x.ckpt")
     XCTAssertEqual(Set(H3Sources.all.map(\.id)).count, 3)
   }
+
+  // MARK: Ming-Image
+
+  func testMingConvertsQuantizesAndRegisters() async throws {
+    _ = try script(
+      "ModelConverter",
+      """
+      t=0; while [ $# -gt 0 ]; do case "$1" in --ming-text-encoder) t=1; shift;; -n) n="$2"; shift 2;; -o) o="$2"; shift 2;; -f) f="$2"; shift 2;; *) shift;; esac; done
+      [ -e "$f" ] || { echo "missing input $f"; exit 3; }
+      echo data > "$o/${n}_f16.ckpt"
+      [ $t = 1 ] && echo '{}' > "$o/${n}_tokenizer.json"
+      exit 0
+      """)
+    _ = try script(
+      "QuantI8x",
+      """
+      while [ $# -gt 0 ]; do case "$1" in -i) i="$2"; shift 2;; -m) m="$2"; shift 2;; -o) o="$2"; shift 2;; *) shift;; esac; done
+      [ -e "$i" ] || { echo "missing input $i"; exit 3; }
+      [ "$m" = "ming_image" ] || { echo "wrong version $m"; exit 5; }
+      echo data > "$o"
+      """)
+    let job = MingJob(
+      modelFile: try input("model.safetensors"), textEncoderFile: try input("encoder.safetensors"),
+      vaeFile: try input("vae.safetensors"), models: models, work: models.appendingPathComponent("_w"),
+      helpers: helpers, precision: .eightBitS)
+    let events = Events()
+    try await WorkRunner().run(MingConversion.steps(job), work: job.work) { events.add($0) }
+    XCTAssertEqual(
+      events.finished, ["encoder", "quantizeEncoder", "vision", "vae", "model", "quantize", "register", "cleanup"])
+    let fm = FileManager.default
+    for file in [
+      "ming_image_0.1_design_i8x.ckpt", "ming_image_ling_mini_2.0_i8x.ckpt", "ming_image_ling_mini_2.0_tokenizer.json",
+      "ming_image_ling_mini_2.0_vision_f16.ckpt", "ming_image_vae_f16.ckpt",
+    ] {
+      XCTAssertTrue(fm.fileExists(atPath: models.appendingPathComponent(file).path), file)
+    }
+    for file in ["ming_image_0.1_design_f16.ckpt", "ming_image_ling_mini_2.0_f16.ckpt"] {
+      XCTAssertFalse(fm.fileExists(atPath: models.appendingPathComponent(file).path), file)
+    }
+    let list = try JSONSerialization.jsonObject(with: Data(contentsOf: models.appendingPathComponent("custom.json"))) as! [[String: Any]]
+    XCTAssertEqual(list.map { $0["file"] as? String }, ["ming_image_0.1_design_i8x.ckpt"])
+    let entry = try XCTUnwrap(list.first)
+    XCTAssertEqual(entry["version"] as? String, "ming_image")
+    XCTAssertEqual(entry["text_encoder"] as? String, "ming_image_ling_mini_2.0_i8x.ckpt")
+    XCTAssertEqual(entry["clip_encoder"] as? String, "ming_image_ling_mini_2.0_vision_f16.ckpt")
+    XCTAssertEqual(entry["autoencoder"] as? String, "ming_image_vae_f16.ckpt")
+    // The activation scaling that keeps large images with long prompts from overflowing to NaN.
+    let mmdit = try XCTUnwrap(entry["mmdit"] as? [String: Any])
+    let qk = try XCTUnwrap(mmdit["activation_qk_scaling"] as? [String: Int])
+    XCTAssertEqual(qk.count, 34)
+    XCTAssertEqual(qk["0"], 1)
+    XCTAssertEqual(qk["2"], 32)
+    XCTAssertEqual((mmdit["activation_ffn_scaling"] as? [String: Int])?["1"], 2)
+  }
+
+  func testMingFilesComeFromComfyOrg() {
+    XCTAssertEqual(
+      MingSources.textEncoder.url.absoluteString,
+      "https://huggingface.co/Comfy-Org/Ming-Image/resolve/main/text_encoders/ming_image_0.1_ling_mini_2.0_bf16.safetensors?download=true")
+    XCTAssertEqual(MingSources.model.size, 12_309_858_664)
+    XCTAssertEqual(Set(MingSources.all.map(\.id)).count, 3)
+  }
 }
 
 final class PrepFetchTests: XCTestCase {
@@ -212,4 +274,24 @@ private final class LogBox: @unchecked Sendable {
   private var all = [String]()
   func add(_ line: String) { lock.withLock { all.append(line) } }
   var lines: [String] { lock.withLock { all } }
+}
+
+/// The Ming-Image conversion with the real tools and weights. Skipped unless MING_REAL_SOURCES (the folder with the
+/// three Comfy-Org files), MING_REAL_HELPERS (ModelConverter and QuantI8x) and MING_REAL_MODELS (an empty folder) are set.
+final class MingRealConversionTests: XCTestCase {
+  func testRealConversion() async throws {
+    let env = ProcessInfo.processInfo.environment
+    guard let sources = env["MING_REAL_SOURCES"], let helpers = env["MING_REAL_HELPERS"],
+      let models = env["MING_REAL_MODELS"]
+    else { throw XCTSkip("Set MING_REAL_SOURCES, MING_REAL_HELPERS and MING_REAL_MODELS to run it.") }
+    let located = FiboSources.locate(MingSources.all, in: URL(fileURLWithPath: sources))
+    let model = try XCTUnwrap(located[MingSources.model])
+    let encoder = try XCTUnwrap(located[MingSources.textEncoder])
+    let vae = try XCTUnwrap(located[MingSources.vae])
+    let folder = URL(fileURLWithPath: models)
+    let job = MingJob(
+      modelFile: model, textEncoderFile: encoder, vaeFile: vae, models: folder,
+      work: folder.appendingPathComponent("_ming-work"), helpers: URL(fileURLWithPath: helpers), precision: .eightBitS)
+    try await WorkRunner().run(MingConversion.steps(job), work: job.work) { event in print(event) }
+  }
 }

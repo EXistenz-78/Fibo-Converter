@@ -1,0 +1,213 @@
+From f7127f2041b65abd77ff4aee5abb6ea96b7d40e6 Mon Sep 17 00:00:00 2001
+From: Antonio D'Achille <existenz70@gmail.com>
+Date: Tue, 24 Nov 2026 16:29:04 +0100
+Subject: [PATCH 7/7] Ming-Image runs Z-Image LoRAs (same DiT):
+ LoRAZoo.versionForModel(_:runningWith:) in every LoRA filter; LoRAZImage
+ takes reference latents
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../Sources/ImageGeneratorUtils.swift         |  2 +-
+ .../Sources/ImageConverter.swift              |  2 +-
+ .../Sources/LocalImageGenerator.swift         | 12 +++++-----
+ .../Sources/ModelPreloader.swift              |  4 ++--
+ Libraries/ModelZoo/Sources/LoRAZoo.swift      | 11 +++++++++
+ .../Sources/Models/UNetProtocol.swift         |  2 +-
+ .../Sources/Models/ZImage.swift               | 23 +++++++++++++------
+ 7 files changed, 38 insertions(+), 18 deletions(-)
+
+diff --git a/Libraries/ImageGenerator/Sources/ImageGeneratorUtils.swift b/Libraries/ImageGenerator/Sources/ImageGeneratorUtils.swift
+index fdd7917..1c552ba 100644
+--- a/Libraries/ImageGenerator/Sources/ImageGeneratorUtils.swift
++++ b/Libraries/ImageGenerator/Sources/ImageGeneratorUtils.swift
+@@ -209,7 +209,7 @@ public struct ImageGeneratorUtils {
+       ? .transparent : nil
+     for lora in configuration.loras {
+       guard let file = lora.file else { continue }
+-      let loraVersion = LoRAZoo.versionForModel(file)
++      let loraVersion = LoRAZoo.versionForModel(file, runningWith: modelVersion)
+ 
+       guard LoRAZoo.isModelDownloaded(file, memorizedBy: memorizedBy),
+         modelVersion == loraVersion || refinerVersion == loraVersion
+diff --git a/Libraries/LocalImageGenerator/Sources/ImageConverter.swift b/Libraries/LocalImageGenerator/Sources/ImageConverter.swift
+index 7c3c41e..ee14421 100644
+--- a/Libraries/LocalImageGenerator/Sources/ImageConverter.swift
++++ b/Libraries/LocalImageGenerator/Sources/ImageConverter.swift
+@@ -1967,7 +1967,7 @@ public enum ImageConverter {
+           guard let file = $0.file, LoRAZoo.isModelDownloaded(file, memorizedBy: memorizedBy) else {
+             return nil
+           }
+-          let loraVersion = LoRAZoo.versionForModel(file)
++          let loraVersion = LoRAZoo.versionForModel(file, runningWith: modelVersion)
+           guard modelVersion == loraVersion || refinerVersion == loraVersion
+           else { return nil }
+           return LoRAConfiguration(
+diff --git a/Libraries/LocalImageGenerator/Sources/LocalImageGenerator.swift b/Libraries/LocalImageGenerator/Sources/LocalImageGenerator.swift
+index 5d63873..43a7366 100644
+--- a/Libraries/LocalImageGenerator/Sources/LocalImageGenerator.swift
++++ b/Libraries/LocalImageGenerator/Sources/LocalImageGenerator.swift
+@@ -4605,7 +4605,7 @@ extension LocalImageGenerator {
+         ] : [])
+       + configuration.loras.compactMap {
+         guard let file = $0.file else { return nil }
+-        let loraVersion = LoRAZoo.versionForModel(file)
++        let loraVersion = LoRAZoo.versionForModel(file, runningWith: modelVersion)
+         guard LoRAZoo.isModelDownloaded(file),
+           modelVersion == loraVersion || refinerVersion == loraVersion
+             || (modelVersion == .kandinsky21 && loraVersion == .v1)
+@@ -6044,7 +6044,7 @@ extension LocalImageGenerator {
+         ] : [])
+       + configuration.loras.compactMap {
+         guard let file = $0.file else { return nil }
+-        let loraVersion = LoRAZoo.versionForModel(file)
++        let loraVersion = LoRAZoo.versionForModel(file, runningWith: modelVersion)
+         guard LoRAZoo.isModelDownloaded(file),
+           modelVersion == loraVersion || refinerVersion == loraVersion
+             || (modelVersion == .kandinsky21 && loraVersion == .v1)
+@@ -7099,7 +7099,7 @@ extension LocalImageGenerator {
+       ? .transparent : nil
+     for lora in configuration.loras {
+       guard let file = lora.file else { continue }
+-      let loraVersion = LoRAZoo.versionForModel(file)
++      let loraVersion = LoRAZoo.versionForModel(file, runningWith: modelVersion)
+       guard LoRAZoo.isModelDownloaded(file),
+         modelVersion == loraVersion || refinerVersion == loraVersion
+           || (modelVersion == .kandinsky21 && loraVersion == .v1)
+@@ -7166,7 +7166,7 @@ extension LocalImageGenerator {
+       ? .transparent : nil
+     for lora in configuration.loras {
+       guard let file = lora.file else { continue }
+-      let loraVersion = LoRAZoo.versionForModel(file)
++      let loraVersion = LoRAZoo.versionForModel(file, runningWith: modelVersion)
+       guard LoRAZoo.isModelDownloaded(file),
+         modelVersion == loraVersion || refinerVersion == loraVersion
+           || (modelVersion == .kandinsky21 && loraVersion == .v1)
+@@ -7575,7 +7575,7 @@ extension LocalImageGenerator {
+         ] : [])
+       + configuration.loras.compactMap {
+         guard let file = $0.file else { return nil }
+-        let loraVersion = LoRAZoo.versionForModel(file)
++        let loraVersion = LoRAZoo.versionForModel(file, runningWith: modelVersion)
+         guard LoRAZoo.isModelDownloaded(file),
+           modelVersion == loraVersion || refinerVersion == loraVersion
+             || (modelVersion == .kandinsky21 && loraVersion == .v1)
+@@ -8547,7 +8547,7 @@ extension LocalImageGenerator {
+         ] : [])
+       + configuration.loras.compactMap {
+         guard let file = $0.file else { return nil }
+-        let loraVersion = LoRAZoo.versionForModel(file)
++        let loraVersion = LoRAZoo.versionForModel(file, runningWith: modelVersion)
+         guard LoRAZoo.isModelDownloaded(file),
+           modelVersion == loraVersion || refinerVersion == loraVersion
+             || (modelVersion == .kandinsky21 && loraVersion == .v1)
+diff --git a/Libraries/LocalImageGenerator/Sources/ModelPreloader.swift b/Libraries/LocalImageGenerator/Sources/ModelPreloader.swift
+index 9bb55cd..288f644 100644
+--- a/Libraries/LocalImageGenerator/Sources/ModelPreloader.swift
++++ b/Libraries/LocalImageGenerator/Sources/ModelPreloader.swift
+@@ -165,7 +165,7 @@ public final class ModelPreloader {
+         } ?? false
+       lora = configuration.loras.compactMap {
+         guard let file = $0.file, LoRAZoo.isModelDownloaded(file),
+-          LoRAZoo.versionForModel(file) == modelVersion
++          LoRAZoo.versionForModel(file, runningWith: modelVersion) == modelVersion
+         else { return nil }
+         guard !isRefinerEnabled || $0.mode == .all || $0.mode == .base else { return nil }
+         return LoRAConfiguration(
+@@ -971,7 +971,7 @@ extension ModelPreloader {
+       } ?? false
+     let newLora: [LoRAConfiguration] = newConfiguration.loras.compactMap {
+       guard let file = $0.file, LoRAZoo.isModelDownloaded(file),
+-        LoRAZoo.versionForModel(file) == version
++        LoRAZoo.versionForModel(file, runningWith: version) == version
+       else { return nil }
+       guard !isRefinerEnabled || $0.mode == .all || $0.mode == .base else { return nil }
+       return LoRAConfiguration(
+diff --git a/Libraries/ModelZoo/Sources/LoRAZoo.swift b/Libraries/ModelZoo/Sources/LoRAZoo.swift
+index 811c06b..56bb074 100644
+--- a/Libraries/ModelZoo/Sources/LoRAZoo.swift
++++ b/Libraries/ModelZoo/Sources/LoRAZoo.swift
+@@ -338,6 +338,17 @@ public struct LoRAZoo: DownloadZoo {
+     return specification.version
+   }
+ 
++  /// The version a LoRA runs as with a model of `modelVersion`. Ming-Image's DiT is Z-Image's
++  /// graph with the same weight names, so a Z-Image LoRA runs on it as a Ming-Image LoRA
++  /// (its text-encoder part, for Qwen3, is not used: Ming's encoder takes no LoRA).
++  public static func versionForModel(_ name: String, runningWith modelVersion: ModelVersion)
++    -> ModelVersion
++  {
++    let version = versionForModel(name)
++    if modelVersion == .mingImage && version == .zImage { return .mingImage }
++    return version
++  }
++
+   public static func modifierForModel(_ name: String) -> SamplerModifier {
+     guard let specification = specificationForModel(name) else { return .none }
+     return specification.modifier ?? .none
+diff --git a/Libraries/SwiftDiffusion/Sources/Models/UNetProtocol.swift b/Libraries/SwiftDiffusion/Sources/Models/UNetProtocol.swift
+index d035a49..d34d5c9 100644
+--- a/Libraries/SwiftDiffusion/Sources/Models/UNetProtocol.swift
++++ b/Libraries/SwiftDiffusion/Sources/Models/UNetProtocol.swift
+@@ -1868,7 +1868,7 @@ extension UNetFromNNC {
+               activationFfnProjUpScaling: activationFfnProjUpScaling,
+               activationFfnScaling: activationFfnScaling,
+               usesFlashAttention: valueOr(useFlashAttention, isBF16 ? .scaleMerged : .scale1),
+-              isBF16: isBF16,
++              isBF16: isBF16, referenceCount: mingReferences,
+               LoRAConfiguration: configuration
+             ).0
+           })
+diff --git a/Libraries/SwiftDiffusion/Sources/Models/ZImage.swift b/Libraries/SwiftDiffusion/Sources/Models/ZImage.swift
+index 41794d3..2d73b95 100644
+--- a/Libraries/SwiftDiffusion/Sources/Models/ZImage.swift
++++ b/Libraries/SwiftDiffusion/Sources/Models/ZImage.swift
+@@ -1375,7 +1375,7 @@ public func LoRAZImage(
+   activationQkScaling: [Int: Int], activationProjScaling: [Int: Int],
+   activationFfnProjUpScaling: [Int: Int], activationFfnScaling: [Int: Int],
+   usesFlashAttention: FlashAttentionLevel, isBF16: Bool, rotaryEmbeddingHeads: Int = 1,
+-  LoRAConfiguration: LoRANetworkConfiguration
++  referenceCount: Int = 0, LoRAConfiguration: LoRANetworkConfiguration
+ ) -> (
+   Model, ModelWeightMapper
+ ) {
+@@ -1386,15 +1386,23 @@ public func LoRAZImage(
+     count: channels, configuration: LoRAConfiguration, index: 0, name: "x_embedder")
+   let h = height / 2
+   let w = width / 2
+-  var xOut = imgIn(
+-    x.reshaped([batchSize, h, 2, w, 2, 16]).permuted(0, 1, 3, 2, 4, 5).contiguous()
+-      .reshaped([batchSize, h * w, 2 * 2 * 16], format: .NHWC)
+-  )
++  func patches(_ latent: Model.IO) -> Model.IO {
++    imgIn(
++      latent.reshaped([batchSize, h, 2, w, 2, 16]).permuted(0, 1, 3, 2, 4, 5).contiguous()
++        .reshaped([batchSize, h * w, 2 * 2 * 16], format: .NHWC))
++  }
++  var xOut = patches(x)
++  // Ming-Image's references, as in `ZImage`: one frame each after the image.
++  let references = (0..<referenceCount).map { _ in Input() }
++  for reference in references {
++    xOut = Functional.concat(axis: 1, xOut, patches(reference), flags: .disableOpt)
++  }
++  let imageTokenCount = h * w * (1 + referenceCount)
+   var mappers = [ModelWeightMapper]()
+   var adaLNChunks = [Input]()
+-  let roundUpHW = (h * w + 31) / 32 * 32
++  let roundUpHW = (imageTokenCount + 31) / 32 * 32
+   let xPadTokens: Input?
+-  if roundUpHW != h * w {
++  if roundUpHW != imageTokenCount {
+     let padTokens = Input()
+     xOut = Functional.concat(axis: 1, xOut, padTokens, flags: .disableOpt)
+     xPadTokens = padTokens
+@@ -1516,6 +1524,7 @@ public func LoRAZImage(
+   inputs.append(rot)
+   inputs.append(txtIn)
+   inputs.append(contentsOf: adaLNChunks)
++  inputs.append(contentsOf: references)
+   return (
+     Model(inputs, [out], trainable: false), mapper
+   )
+-- 
+2.54.0 (Apple Git-157)
+

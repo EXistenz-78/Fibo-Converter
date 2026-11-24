@@ -1,7 +1,7 @@
-From 1bef40c2f8971931220b99c50242e32962c7d504 Mon Sep 17 00:00:00 2001
+From e37a88cb6eac93dd353db26f9d067fc623380dec Mon Sep 17 00:00:00 2001
 From: Antonio D'Achille <existenz70@gmail.com>
 Date: Fri, 20 Nov 2026 10:50:31 +0100
-Subject: [PATCH 2/2] QuantI8x: MiniMax H3 Image 8-bit S rule (as Atelier /
+Subject: [PATCH 4/7] QuantI8x: MiniMax H3 Image 8-bit S rule (as Atelier /
  Draw Things' own i8x files)
 
 Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>

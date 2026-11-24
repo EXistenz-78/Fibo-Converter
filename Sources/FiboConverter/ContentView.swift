@@ -188,6 +188,7 @@ struct ContentView: View {
       FiboView().tabItem { Text("Fibo 2.0 Edit Turbo") }
       GenericView().tabItem { Text("Any safetensors") }
       H3View().tabItem { Text("MiniMax H3 Image") }
+      MingView().tabItem { Text("Ming-Image") }
     }
     .padding(.top, 8)
   }

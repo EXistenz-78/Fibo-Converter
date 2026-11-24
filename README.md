@@ -1,6 +1,6 @@
 # Model Converter
 
-A small macOS app with three tabs that turns model files into models Draw Things, Atelier and DT Hub can run, and
+A small macOS app with four tabs that turns model files into models Draw Things, Atelier and DT Hub can run, and
 registers them in the models folder's `custom.json`:
 
 - **Fibo 2.0 Edit Turbo**: merges the two transformer files of [briaai/Fibo-2.0-edit-turbo](https://huggingface.co/briaai/Fibo-2.0-edit-turbo),
@@ -11,6 +11,13 @@ registers them in the models folder's `custom.json`:
 - **MiniMax H3 Image**: converts the model and the VAE, puts the already-converted text encoder in place, and quantizes the
   model to 8-bit S. Read its licence: it excludes the EU, UK, South Korea and the US. H3 runs only on the Draw Things
   engine fork's server (DT Hub 1.8+ includes it).
+
+- **Ming-Image**: converts the three ComfyUI files of [Comfy-Org/Ming-Image](https://huggingface.co/Comfy-Org/Ming-Image)
+  ([inclusionAI/Ming-Image-0.1-Design](https://huggingface.co/inclusionAI/Ming-Image-0.1-Design), MIT): the model, the Ling
+  text encoder (quantized to 8-bit S, with its tokenizer), the vision tower for editing and the 4-channel VAE, and quantizes
+  the model to 8-bit S. The `custom.json` entry carries the activation scaling that keeps large images with long prompts from
+  turning black. Ming-Image runs only on the Draw Things engine fork's server (DT Hub 1.8.3+ includes it); Z-Image LoRAs work on it.
+  Needs about 55 GB free while it runs (26 GB at the end).
 
 The Any-safetensors and MiniMax H3 tabs are new in 1.1 and have only been tested with stand-in tools, not on real weights.
 
@@ -32,9 +39,9 @@ With 8-bit S only, the full-precision intermediates are moved to the Trash. `cus
 Scripts/build-app.sh      # writes build/Model Converter.app
 swift test                # merge, custom.json and pipeline (with stand-in tools)
 ```
-The conversion tools are built from the Draw Things fork checkout (`FORK`, default `~/Developer-krea2/fork`, branch
-`fibo-tools`: SwiftPM targets `ModelConverter` and `QuantI8x`, an i8x variant of the fork's `ModelQuantizer` that also knows
-the MiniMax H3 Image rule). The patches are in `Third-party/`. The tools are copied into the app (`Contents/Helpers`).
+The conversion tools are built from the Draw Things fork checkout (`FORK`, default `~/Developer-krea2/fork-f4d03b02`, branch
+`ming-image`: SwiftPM targets `ModelConverter` and `QuantI8x`, an i8x variant of the fork's `ModelQuantizer` that also knows
+the MiniMax H3 Image and Ming-Image rules). The patches are in `Third-party/`. The tools are copied into the app (`Contents/Helpers`).
 
 ## Credits and third-party tools
 

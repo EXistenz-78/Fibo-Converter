@@ -1,0 +1,2784 @@
+From a98c72728c8136d1de6ad227812d175f10b42f9d Mon Sep 17 00:00:00 2001
+From: Antonio D'Achille <existenz70@gmail.com>
+Date: Mon, 23 Nov 2026 22:30:32 +0100
+Subject: [PATCH 5/7] Ming-Image 0.1 Design: converters, text encoder graph,
+ VAE, DiT conditioning (not wired into generation)
+
+Adds ModelVersion.mingImage (the DiT is Z-Image's graph without the learned pad tokens) and
+everything needed to convert and run its parts, each checked against a PyTorch reference:
+
+- ModelImporter/Converter/QuantI8x: DiT recognised and converted; 8-bit S (i8x) rule.
+- ModelConverter --ming-text-encoder: Ling MoE language model, Qwen2 connector, projections and
+  the tokenizer from ComfyUI's single file; QuantI8x --text-encoder keeps routers, embeddings,
+  query tokens and the small projections in FP16.
+- ModelConverter --ming-vae: the Wan VAE graph with four (RGBA) channels.
+- MingText.swift: Ling layer by layer (the host picks the experts inside score groups,
+  MoERouting only weights them), connector, directvlm projection, VAE wrappers.
+- ZImage.swift: MingImageFixed (queries through cap_embedder plus 3840-wide tokens, no padding)
+  and ZImageRotaryPositionEmbedding.imageTimePosition.
+- QuantI8x: BFloat16 tensors go through Float (a direct CPU BFloat16 -> Float16 conversion
+  returns zeros).
+- Test executables MingEncoderTest, MingVAETest, MingDiTTest.
+
+Generation is not wired in: UNetFixedEncoder and TextEncoder stop with an error for .mingImage.
+Plan and results: DT Hub docs/superpowers/specs/2026-11-23-ming-image-design.md.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ Apps/MingDiTTest/main.swift                   | 236 ++++++++
+ Apps/MingEncoderTest/main.swift               | 243 +++++++++
+ Apps/MingVAETest/main.swift                   | 143 +++++
+ Apps/ModelConverter/Converter.swift           | 240 ++++++++
+ Apps/QuantI8x/Quantizer.swift                 |  38 +-
+ .../DataModels/Sources/DeviceCapability.swift |   2 +-
+ .../ModelOp/Sources/ControlNetImporter.swift  |   6 +-
+ Libraries/ModelOp/Sources/LoRAExporter.swift  |   4 +-
+ Libraries/ModelOp/Sources/LoRAImporter.swift  |  16 +-
+ Libraries/ModelOp/Sources/ModelImporter.swift |  53 +-
+ Libraries/ModelZoo/Sources/ComputeUnits.swift |   6 +-
+ Libraries/ModelZoo/Sources/LoRAZoo.swift      |   2 +
+ Libraries/ModelZoo/Sources/ModelZoo.swift     |  27 +-
+ .../Sources/TextualInversionZoo.swift         |   4 +-
+ .../SwiftDiffusion/Sources/ControlModel.swift |  42 +-
+ .../SwiftDiffusion/Sources/FirstStage.swift   |  14 +-
+ .../Sources/Models/MingText.swift             | 514 ++++++++++++++++++
+ .../Sources/Models/UNetProtocol.swift         |  30 +-
+ .../Sources/Models/ZImage.swift               | 107 +++-
+ .../Sources/Samplers/Sampler.swift            |   3 +-
+ .../Sources/TeaCache/TeaCache.swift           |  10 +-
+ .../SwiftDiffusion/Sources/TextEncoder.swift  |   9 +-
+ .../Sources/UNetFixedEncoder.swift            |   9 +-
+ Package.swift                                 |  28 +
+ 24 files changed, 1682 insertions(+), 104 deletions(-)
+ create mode 100644 Apps/MingDiTTest/main.swift
+ create mode 100644 Apps/MingEncoderTest/main.swift
+ create mode 100644 Apps/MingVAETest/main.swift
+ create mode 100644 Libraries/SwiftDiffusion/Sources/Models/MingText.swift
+
+diff --git a/Apps/MingDiTTest/main.swift b/Apps/MingDiTTest/main.swift
+new file mode 100644
+index 0000000..b3ada1d
+--- /dev/null
++++ b/Apps/MingDiTTest/main.swift
+@@ -0,0 +1,236 @@
++import Diffusion
++import Foundation
++import NNC
++
++// One forward pass of Ming-Image's diffusion transformer from the converted checkpoint, compared
++// with the PyTorch reference (Tools/ming-reference/ref_dit.py in DT Hub).
++//
++// Usage: MingDiTTest <design.ckpt> <ref_encoder.safetensors> <ref_dit.safetensors>
++
++typealias Half = Float16
++
++let arguments = CommandLine.arguments
++guard arguments.count >= 4 else {
++  print("Usage: MingDiTTest <design.ckpt> <ref_encoder.safetensors> <ref_dit.safetensors>")
++  exit(2)
++}
++let checkpoint = arguments[1]
++guard let encoderReference = SafeTensors(url: URL(fileURLWithPath: arguments[2])),
++  let ditReference = SafeTensors(url: URL(fileURLWithPath: arguments[3]))
++else { fatalError("Cannot open the references") }
++func tensor(_ file: SafeTensors, _ name: String) -> Tensor<Float> {
++  try! file.with(file.states[name]!) { Tensor<Float>(from: $0).toCPU() }
++}
++
++let graph = DynamicGraph()
++let codec: DynamicGraph.Store.Codec = [.jit, .q6p, .q8p, .i8x, .ezm7, .externalData]
++let isBF16 = ProcessInfo.processInfo.environment["MING_BF16"] != nil
++let refinerLayers = Int(ProcessInfo.processInfo.environment["MING_REFINERS"] ?? "2")!
++let channels = 3_840
++let layers = Int(ProcessInfo.processInfo.environment["MING_LAYERS"] ?? "30")!
++
++let queries = tensor(encoderReference, "query_embeds")  // [256, 2560]
++let direct = tensor(encoderReference, "directvlm")  // [L, 3840]
++let latents = tensor(ditReference, "latents")  // [1, h, w, 16]
++let expected = tensor(ditReference, "output")
++let timestepInput = tensor(ditReference, "timestep")[0]  // (1000 - sigma * 1000) / 1000
++let queryLength = queries.shape[0]
++let directLength = direct.shape[0]
++let captionLength = queryLength + directLength
++let paddedCaptionLength = (captionLength + 31) / 32 * 32
++let height = latents.shape[1]
++let width = latents.shape[2]
++print("Caption \(captionLength) tokens (padded \(paddedCaptionLength)), latents \(height)x\(width)")
++
++func half(_ source: Tensor<Float>, _ shape: TensorShapeFormat) -> DynamicGraph.Tensor<Half> {
++  var result = Tensor<Half>(.CPU, shape)
++  let count = source.shape.reduce(1, *)
++  precondition(count == result.shape.reduce(1, *))
++  source.withUnsafeBytes { raw in
++    let values = raw.baseAddress!.assumingMemoryBound(to: Float.self)
++    result.withUnsafeMutableBytes { target in
++      let out = target.baseAddress!.assumingMemoryBound(to: Half.self)
++      for i in 0..<count { out[i] = Half(values[i]) }
++    }
++  }
++  return graph.variable(result.toGPU(0))
++}
++
++if ProcessInfo.processInfo.environment["MING_BF16TEST"] != nil {
++  var floats = Tensor<Float>(.CPU, .WC(1, 8))
++  for i in 0..<8 { floats[0, i] = Float(i) * 0.37 - 1.1 }
++  let bf = Tensor<BFloat16>(from: floats)
++  let h = Tensor<Float16>(from: bf)
++  let back = Tensor<Float>(from: h)
++  let viaFloat = Tensor<Float>(from: bf)
++  print("float -> bf16 -> float:", (0..<8).map { viaFloat[0, $0] })
++  let direct = Tensor<Float16>(from: floats)
++  print("float -> f16:", (0..<8).map { Float(direct[0, $0]) })
++  print("float -> bf16 -> f16 -> float:", (0..<8).map { back[0, $0] }, "from", (0..<8).map { floats[0, $0] })
++  exit(0)
++}
++if let sourcePath = ProcessInfo.processInfo.environment["MING_SOURCE"] {
++  // Does the quantized checkpoint hold the source's weights? Compare one matrix.
++  guard let source = SafeTensors(url: URL(fileURLWithPath: sourcePath)) else { fatalError() }
++  let pairs = [
++    ("__dit__[t-context_refiner_k-0-0]", "context_refiner.0.attention.to_k.weight"),
++    ("__dit__[t-context_refiner_v-0-0]", "context_refiner.0.attention.to_v.weight"),
++    ("__dit__[t-context_refiner_q-0-0]", "context_refiner.0.attention.to_q.weight"),
++  ]
++  for (key, sourceKey) in pairs {
++    var stored: Tensor<Float>? = nil
++    graph.openStore(checkpoint, flags: .readOnly) { store in
++      stored = store.read(key, kind: .CPU, codec: [.q6p, .q8p, .i8x, .ezm7, .externalData]).map { Tensor<Float>(from: $0).toCPU() }
++    }
++    let original = try! source.with(source.states[sourceKey]!) { Tensor<Float>(from: $0).toCPU() }
++    guard let stored else { print("\(key): missing"); continue }
++    var difference = 0.0
++    var norm = 0.0
++    var swappedDifference = 0.0
++    for i in 0..<64 {
++      for j in 0..<channels {
++        let a = Double(stored[i, j])
++        let b = Double(original[i, j])
++        difference += (a - b) * (a - b)
++        norm += b * b
++      }
++    }
++    print("\(key) vs \(sourceKey): relative error \(String(format: "%.5f", (difference / norm).squareRoot())) (first 64 rows)")
++    _ = swappedDifference
++  }
++  exit(0)
++}
++
++try graph.withNoGrad {
++  let txt = half(queries, .HWC(1, queryLength, 2_560))
++  let directTokens = half(direct, .HWC(1, directLength, channels))
++  let x = half(latents, .NHWC(1, height, width, 16))
++
++  // The time embedding of 1000 * timestepInput: cos then sin of t * exp(-ln(10000) i / 128).
++  var timeEmbedding = Tensor<Half>(.CPU, .WC(1, 256))
++  for i in 0..<128 {
++    let frequency = exp(-log(10_000.0) * Double(i) / 128)
++    let angle = Double(timestepInput) * 1_000 * frequency
++    timeEmbedding[0, i] = Half(cos(angle))
++    timeEmbedding[0, 128 + i] = Half(sin(angle))
++  }
++  let timeEmbeds = graph.variable(timeEmbedding.toGPU(0))
++
++  let captionRotary = graph.variable(
++    Tensor<Half>(
++      from: ZImageRotaryPositionEmbedding(
++        height: 0, width: 0, tokenLength: captionLength, imagePaddedLength: 0)
++    ).toGPU(0))
++  let tokensHeight = height / 2
++  let tokensWidth = width / 2
++  precondition((tokensHeight * tokensWidth) % 32 == 0, "image tokens would need padding")
++  let imageRotary = graph.variable(
++    Tensor<Half>(
++      from: ZImageRotaryPositionEmbedding(
++        height: tokensHeight, width: tokensWidth, tokenLength: captionLength,
++        imagePaddedLength: 0, imageTimePosition: paddedCaptionLength)
++    ).toGPU(0))
++
++  let flash: FlashAttentionLevel = ProcessInfo.processInfo.environment["MING_FLASH"] == "merged" ? .scaleMerged : .scale1
++  let (fixed, _) = MingImageFixed(
++    batchSize: 1, queryLength: queryLength, directLength: directLength, channels: channels,
++    layers: layers, activationQkScaling: [:], activationProjScaling: [:],
++    activationFfnProjUpScaling: [:], activationFfnScaling: [:], usesFlashAttention: flash,
++    isBF16: isBF16, contextRefinerLayers: refinerLayers)
++  fixed.compile(inputs: txt, directTokens, captionRotary, timeEmbeds)
++  graph.openStore(checkpoint, flags: .readOnly) { store in
++    do {
++      try store.read("dit", model: fixed, strict: true, codec: codec) { name, dataType, format, shape in
++        if ProcessInfo.processInfo.environment["MING_TRACE"] != nil {
++          FileHandle.standardError.write(Data("read \(name) \(dataType) \(shape)\n".utf8))
++        }
++        return .continue(name)
++      }
++    } catch {
++      print("  ! reading the fixed part: \(error)")
++    }
++  }
++  let fixedOutputs = fixed(inputs: txt, directTokens, captionRotary, timeEmbeds)
++  print("Fixed outputs: \(fixedOutputs.count)")
++  func relative(_ mine: Tensor<Float>, _ theirs: Tensor<Float>, rows: Int, columns: Int, offset: Int = 0) -> Double {
++    var difference = 0.0
++    var norm = 0.0
++    for i in 0..<rows {
++      for j in 0..<columns {
++        let m = mine.shape.count == 3 ? mine[0, i, j] : mine[i, j]
++        let d = Double(m - theirs[i + offset, j])
++        difference += d * d
++        norm += Double(theirs[i + offset, j] * theirs[i + offset, j])
++      }
++    }
++    return (difference / norm).squareRoot()
++  }
++  do {
++    // cap_norm + cap_embedder alone, on the 256 queries.
++    let norm = RMSNorm(epsilon: 1e-5, axis: [2], name: "cap_norm")
++    let embedder = Dense(count: channels, name: "cap_embedder")
++    let input = Input()
++    let probe = Model([input], [embedder(norm(input))])
++    probe.compile(inputs: txt)
++    graph.openStore(checkpoint, flags: .readOnly) { store in
++      store.read("dit", model: probe, codec: codec)
++    }
++    let embedded = probe(inputs: txt)[0].as(of: Half.self)
++    let mine = Tensor<Float>(from: embedded.rawValue.toCPU())
++    print(
++      "cap_embedder (queries) vs PyTorch: relative error \(String(format: "%.5f", relative(mine, tensor(ditReference, "cap_embedded"), rows: queryLength, columns: channels)))"
++    )
++  }
++  do {
++    // The refined caption (FP32) against the reference's, without its padding rows.
++    let mine = Tensor<Float>(from: fixedOutputs[0].as(of: Float.self).rawValue.toCPU())
++    let theirs = tensor(
++      ditReference,
++      refinerLayers == 0 ? "cap_embedded" : (refinerLayers == 1 ? "cap_refiner0" : "cap_refined"))
++    var difference = 0.0
++    var norm = 0.0
++    for i in 0..<captionLength {
++      for j in 0..<channels {
++        let d = Double(mine[0, i, j] - theirs[i, j])
++        difference += d * d
++        norm += Double(theirs[i, j] * theirs[i, j])
++      }
++    }
++    print("refined caption vs PyTorch: relative error \(String(format: "%.5f", (difference / norm).squareRoot()))")
++  }
++
++  let (unet, _) = ZImage(
++    batchSize: 1, height: height, width: width, textLength: captionLength, channels: channels,
++    layers: layers, activationQkScaling: [:], activationProjScaling: [:],
++    activationFfnProjUpScaling: [:], activationFfnScaling: [:], usesFlashAttention: flash,
++    isBF16: isBF16)
++  var inputs: [DynamicGraph.AnyTensor] = [x, imageRotary]
++  inputs.append(contentsOf: fixedOutputs)
++  unet.compile(inputs: inputs)
++  graph.openStore(checkpoint, flags: .readOnly) { store in
++    do { try store.read("dit", model: unet, strict: true, codec: codec) } catch {
++      print("  ! reading the transformer: \(error)")
++    }
++  }
++  let output = unet(inputs: x, Array(inputs.dropFirst()))[0].as(of: Half.self)
++  // The engine's graph negates the output (the reference's pipeline does it after the model).
++  let result = Tensor<Float>(from: output.rawValue.toCPU())
++  var difference = 0.0
++  var norm = 0.0
++  var worst: Float = 0
++  for y in 0..<height {
++    for xx in 0..<width {
++      for c in 0..<16 {
++        let mine = -result[0, y, xx, c]
++        let theirs = expected[0, y, xx, c]
++        let d = Double(mine - theirs)
++        difference += d * d
++        norm += Double(theirs * theirs)
++        worst = max(worst, abs(mine - theirs))
++      }
++    }
++  }
++  print(
++    "DiT output vs PyTorch: relative error \(String(format: "%.5f", (difference / norm).squareRoot())), max |diff| \(worst)"
++  )
++}
+diff --git a/Apps/MingEncoderTest/main.swift b/Apps/MingEncoderTest/main.swift
+new file mode 100644
+index 0000000..977842d
+--- /dev/null
++++ b/Apps/MingEncoderTest/main.swift
+@@ -0,0 +1,243 @@
++import Diffusion
++import Foundation
++import NNC
++
++// Runs Ming-Image's Ling language model layer by layer from the converted checkpoint and compares
++// each layer's output with the PyTorch reference (Tools/ming-reference/ref_encoder.py in DT Hub).
++//
++// Usage: MingEncoderTest <reference.safetensors> <ming_image_ling_mini_2.0_f16.ckpt> [layers]
++
++typealias Half = Float16
++
++let arguments = CommandLine.arguments
++guard arguments.count >= 3 else {
++  print("Usage: MingEncoderTest <reference.safetensors> <encoder.ckpt> [layers]")
++  exit(2)
++}
++let layerLimit = arguments.count > 3 ? Int(arguments[3])! : 20
++let configuration = MingLingConfiguration.ming
++
++guard let reference = SafeTensors(url: URL(fileURLWithPath: arguments[1])) else {
++  fatalError("Cannot open \(arguments[1])")
++}
++func referenceTensor(_ name: String) -> Tensor<Float> {
++  guard let descriptor = reference.states[name] else { fatalError("No \(name) in the reference") }
++  return try! reference.with(descriptor) { Tensor<Float>(from: $0).toCPU() }
++}
++
++let checkpoint = arguments[2]
++let graph = DynamicGraph()
++let codec: DynamicGraph.Store.Codec = [.ezm7, .q8p, .q6p, .q4p, .i8x, .jit, .externalData]
++
++func read(_ model: Model, _ label: String, key: String = "ming_text", path: String? = nil) {
++  graph.openStore(path ?? checkpoint, flags: .readOnly) { store in
++    do {
++      try store.read(key, model: model, strict: true, codec: codec)
++    } catch {
++      print("  ! reading \(label): \(error)")
++    }
++  }
++}
++
++func compare(_ label: String, _ value: Tensor<Float>, _ expected: Tensor<Float>) {
++  let rows = expected.shape[0]
++  let columns = expected.shape.count > 1 ? expected.shape[1] : 1
++  precondition(value.shape[0] == rows, "\(label): \(value.shape) vs \(expected.shape)")
++  var maxDifference: Float = 0
++  var squares = 0.0
++  var expectedSquares = 0.0
++  var worst = (0, 0)
++  for i in 0..<rows {
++    for j in 0..<columns {
++      let a = expected.shape.count > 1 ? value[i, j] : value[i]
++      let b = expected.shape.count > 1 ? expected[i, j] : expected[i]
++      let d = abs(a - b)
++      if d > maxDifference {
++        maxDifference = d
++        worst = (i, j)
++      }
++      squares += Double(d * d)
++      expectedSquares += Double(b * b)
++    }
++  }
++  let relative = (squares / max(expectedSquares, 1e-30)).squareRoot()
++  let status = relative < 2e-2 ? "ok " : "BAD"
++  print(
++    "\(status) \(label): relative error \(String(format: "%.5f", relative)), max |diff| \(maxDifference) at \(worst)"
++  )
++}
++
++// Reference inputs.
++let idsReference = referenceTensor("ids")
++let tokenLength = idsReference.shape[0]
++let ids = (0..<tokenLength).map { Int32(idsReference[$0]) }
++let positionsReference = referenceTensor("positions")
++let positions = (0..<3).map { row in (0..<tokenLength).map { Int(positionsReference[row, $0]) } }
++let patchToken: Int32 = 157_157
++let isPatch = ids.map { $0 == patchToken }
++print("Tokens: \(tokenLength), query tokens: \(isPatch.filter { $0 }.count)")
++
++try graph.withNoGrad {
++  // Embedding, with the learnable queries in the patch rows.
++  var queries: Tensor<Float>? = nil
++  graph.openStore(checkpoint, flags: .readOnly) { store in
++    if let tensor = store.read("query_tokens") {
++      queries = Tensor<Float>(from: tensor).toCPU()
++    }
++  }
++  guard let queries else { fatalError("query_tokens is missing from the checkpoint") }
++  var keep = Tensor<Float>(.CPU, .WC(tokenLength, 1))
++  var injected = Tensor<Float>(.CPU, .WC(tokenLength, configuration.hiddenSize))
++  var queryRow = 0
++  for i in 0..<tokenLength {
++    keep[i, 0] = isPatch[i] ? 0 : 1
++    for j in 0..<configuration.hiddenSize {
++      injected[i, j] = isPatch[i] ? queries[queryRow, j] : 0
++    }
++    if isPatch[i] { queryRow += 1 }
++  }
++  let tokensGPU = graph.variable(Tensor<Int32>(ids, .CPU, .C(tokenLength)).toGPU(0))
++  let (_, embedding) = MingLingEmbedding(Half.self, tokenLength: tokenLength)
++  embedding.compile(
++    inputs: tokensGPU, graph.variable(keep.toGPU(0)), graph.variable(injected.toGPU(0)))
++  read(embedding, "embedding")
++  var x = embedding(inputs: tokensGPU, graph.variable(keep.toGPU(0)), graph.variable(injected.toGPU(0)))[0]
++    .as(of: Float.self)
++  compare("hidden_0 (embedding)", x.rawValue.toCPU(), referenceTensor("hidden_0"))
++
++  let rotary = graph.variable(
++    MingLingRotaryEmbedding(positions: positions, of: Half.self).toGPU(0))
++  var mask = Tensor<Half>(
++    Array(repeating: 0, count: tokenLength * tokenLength), .CPU, .NHWC(1, 1, tokenLength, tokenLength))
++  for row in 0..<(tokenLength - 1) {
++    for column in (row + 1)..<tokenLength {
++      mask[0, 0, row, column] = -Half.greatestFiniteMagnitude
++    }
++  }
++  let maskGPU = graph.variable(mask.toGPU(0))
++
++  var saved = [Int: Tensor<Float>]()
++  for layer in 0..<min(layerLimit, configuration.layers) {
++    let (_, attention) = MingLingAttentionHalf(
++      Half.self, layer: layer, tokenLength: tokenLength, usesFlashAttention: true)
++    attention.compile(inputs: x, rotary, maskGPU)
++    read(attention, "layer \(layer) attention")
++    let halves = attention(inputs: x, rotary, maskGPU).map { $0.as(of: Float.self) }
++    let residual = halves[MingLingAttentionOutputs.residual]
++    let normalized = halves[MingLingAttentionOutputs.normalized]
++    if layer < configuration.denseLayers {
++      let (_, dense) = MingLingDenseHalf(Half.self, layer: layer)
++      dense.compile(inputs: residual, normalized)
++      read(dense, "layer \(layer) dense")
++      x = dense(inputs: residual, normalized)[0].as(of: Float.self)
++    } else {
++      // Routing on the host: the image gate for the query rows, the text gate for the rest.
++      let textLogits = halves[MingLingAttentionOutputs.textLogits].rawValue.toCPU()
++      let imageLogits = halves[MingLingAttentionOutputs.imageLogits].rawValue.toCPU()
++      var textBias = Tensor<Float>(.CPU, .C(configuration.experts))
++      var imageBias = Tensor<Float>(.CPU, .C(configuration.experts))
++      graph.openStore(checkpoint, flags: .readOnly) { store in
++        if let t = store.read("layers.\(layer).gate.expert_bias") {
++          textBias = Tensor<Float>(from: t).toCPU()
++        }
++        if let t = store.read("layers.\(layer).image_gate.expert_bias") {
++          imageBias = Tensor<Float>(from: t).toCPU()
++        }
++      }
++      var chosen = Tensor<Float>(.CPU, .WC(tokenLength, configuration.experts))
++      var scores = [Float](repeating: 0, count: tokenLength * configuration.experts)
++      for i in 0..<tokenLength {
++        for e in 0..<configuration.experts {
++          let logit = isPatch[i] ? imageLogits[i, e] : textLogits[i, e]
++          let bias = isPatch[i] ? imageBias[e] : textBias[e]
++          chosen[i, e] = logit
++          scores[i * configuration.experts + e] = 1 / (1 + exp(-logit)) + bias
++        }
++      }
++      let selected = MingLingSelectExperts(scoresWithBias: scores, tokenLength: tokenLength)
++      if layer == 1 {
++        // Layer 1's routing in the reference: the experts per token, order aside.
++        let expectedIndex = referenceTensor("router_l1_idx")
++        var mismatches = 0
++        for i in 0..<tokenLength {
++          let mine = Set(
++            (0..<configuration.expertsPerToken).map { Int(selected[i * configuration.expertsPerToken + $0]) })
++          let theirs = Set((0..<configuration.expertsPerToken).map { Int(expectedIndex[i, $0]) })
++          if mine != theirs { mismatches += 1 }
++        }
++        print("\(mismatches == 0 ? "ok " : "BAD") layer 1 routing: \(mismatches) tokens differ")
++      }
++      let (_, moe) = MingLingMoEHalf(layer: layer, tokenLength: tokenLength)
++      let logitsGPU = graph.variable(chosen.toGPU(0))
++      let selectedGPU = graph.variable(
++        Tensor<Int32>(selected, .CPU, .WC(tokenLength, configuration.expertsPerToken)).toGPU(0))
++      moe.compile(inputs: residual, normalized, logitsGPU, selectedGPU)
++      read(moe, "layer \(layer) MoE")
++      x = moe(inputs: residual, normalized, logitsGPU, selectedGPU)[0].as(of: Float.self)
++    }
++    if layer + 1 == 5 || layer + 1 == 12 { saved[layer + 1] = x.rawValue.toCPU() }
++    if layer + 1 < configuration.layers {
++      compare("hidden_\(layer + 1) (after layer \(layer))", x.rawValue.toCPU(), referenceTensor("hidden_\(layer + 1)"))
++    }
++  }
++  if layerLimit >= configuration.layers {
++    let (_, norm) = MingLingFinalNorm()
++    norm.compile(inputs: x)
++    read(norm, "final norm")
++    let final = norm(inputs: x)[0].as(of: Float.self)
++    let finalCPU = final.rawValue.toCPU()
++    compare("hidden_20 (final norm)", finalCPU, referenceTensor("hidden_20"))
++    saved[20] = finalCPU
++
++    // Query stream: the 256 query rows -> proj_in -> connector -> proj_out.
++    var queryRowsHalf = Tensor<Half>(.CPU, .WC(256, configuration.hiddenSize))
++    var row = 0
++    for i in 0..<tokenLength where isPatch[i] {
++      for j in 0..<configuration.hiddenSize { queryRowsHalf[row, j] = Half(finalCPU[i, j]) }
++      row += 1
++    }
++    let (_, connector) = MingConnector(Half.self, tokenLength: 256, usesFlashAttention: true)
++    let queryGPU = graph.variable(queryRowsHalf.toGPU(0))
++    let connectorRotary = graph.variable(
++      MingConnectorRotaryEmbedding(length: 256, of: Half.self).toGPU(0))
++    connector.compile(inputs: queryGPU, connectorRotary)
++    read(connector, "connector")
++    let conditioning = connector(inputs: queryGPU, connectorRotary)[0].as(of: Half.self)
++    compare(
++      "query_embeds (connector)", Tensor<Float>(from: conditioning.rawValue.toCPU()),
++      referenceTensor("query_embeds"))
++
++    // The connector alone, fed with the reference's own final hidden states.
++    let referenceFinal = referenceTensor("hidden_20")
++    var referenceRows = Tensor<Half>(.CPU, .WC(256, configuration.hiddenSize))
++    row = 0
++    for i in 0..<tokenLength where isPatch[i] {
++      for j in 0..<configuration.hiddenSize { referenceRows[row, j] = Half(referenceFinal[i, j]) }
++      row += 1
++    }
++    let isolated = connector(inputs: graph.variable(referenceRows.toGPU(0)), connectorRotary)[0]
++      .as(of: Half.self)
++    compare(
++      "query_embeds (connector alone, reference input)",
++      Tensor<Float>(from: isolated.rawValue.toCPU()), referenceTensor("query_embeds"))
++
++    // Second stream: layers 5, 12 and 20 over the prompt tokens.
++    let prefixLength = ids.firstIndex(of: 157_158)!
++    var directInput = Tensor<Half>(.CPU, .WC(prefixLength, 3 * configuration.hiddenSize))
++    for (part, layer) in [5, 12, 20].enumerated() {
++      let source = saved[layer]!
++      for i in 0..<prefixLength {
++        for j in 0..<configuration.hiddenSize {
++          directInput[i, part * configuration.hiddenSize + j] = Half(source[i, j])
++        }
++      }
++    }
++    let (_, direct) = MingDirectVLMProjection(Half.self)
++    let directGPU = graph.variable(directInput.toGPU(0))
++    direct.compile(inputs: directGPU)
++    read(direct, "directvlm")
++    let directOutput = direct(inputs: directGPU)[0].as(of: Half.self)
++    compare(
++      "directvlm", Tensor<Float>(from: directOutput.rawValue.toCPU()), referenceTensor("directvlm"))
++  }
++}
+diff --git a/Apps/MingVAETest/main.swift b/Apps/MingVAETest/main.swift
+new file mode 100644
+index 0000000..1001021
+--- /dev/null
++++ b/Apps/MingVAETest/main.swift
+@@ -0,0 +1,143 @@
++import Diffusion
++import Foundation
++import NNC
++
++// Round trip through Ming-Image's converted VAE: encode a synthetic RGBA picture, decode the
++// latents, and report how well the picture comes back (PSNR per channel).
++//
++// Usage: MingVAETest <ming_image_vae_f16.ckpt> <reference.safetensors>
++// The reference (Tools/ming-reference/ref_vae.py in DT Hub) holds the picture, its latents and
++// their decoding from PyTorch.
++
++typealias Half = Float16
++
++let arguments = CommandLine.arguments
++guard arguments.count >= 2 else {
++  print("Usage: MingVAETest <vae.ckpt> [size]")
++  exit(2)
++}
++let checkpoint = arguments[1]
++guard arguments.count > 2, let reference = SafeTensors(url: URL(fileURLWithPath: arguments[2]))
++else {
++  print("Usage: MingVAETest <vae.ckpt> <reference.safetensors>")
++  exit(2)
++}
++func referenceTensor(_ name: String) -> Tensor<Float> {
++  try! reference.with(reference.states[name]!) { Tensor<Float>(from: $0).toCPU() }
++}
++let referenceImage = referenceTensor("image")
++let size = referenceImage.shape[1]
++let latentSize = size / 8
++let graph = DynamicGraph()
++let codec: DynamicGraph.Store.Codec = [.ezm7, .jit, .externalData]
++
++/// The engine reads a depth-1 VAE's 3D convolutions (conv_in, conv_out and the residual blocks'
++/// two) by keeping only the last temporal tap, the one a causal convolution applies to a single
++/// frame (FirstStage.swift does the same). The other weights are stored as they are.
++func read(_ model: Model, _ key: String) {
++  graph.openStore(checkpoint, flags: .readOnly) { store in
++    do {
++      try store.read(key, model: model, strict: true, codec: codec) {
++        name, dataType, format, shape in
++        guard
++          name.hasSuffix("-0]")
++            && (name.hasPrefix("__\(key)__[t-conv_in-") || name.hasPrefix("__\(key)__[t-conv_out-")
++              || name.hasPrefix("__\(key)__[t-resnet_conv1-")
++              || name.hasPrefix("__\(key)__[t-resnet_conv2-"))
++        else { return .continue(name) }
++        guard
++          var tensor = store.read(name, kind: .CPU, codec: codec).map({ Tensor<Half>(from: $0) })
++        else { return .continue(name) }
++        let channels = tensor.shape.reduce(1, *) / (3 * 3 * 3)
++        let outChannels = shape.reduce(1, *) / (3 * 3)
++        tensor = tensor.reshaped(.NCHW(channels, 3, 3, 3))
++        guard channels < outChannels else {
++          return .final(tensor[0..<channels, 2..<3, 0..<3, 0..<3].contiguous())
++        }
++        var padded = Tensor<Half>(
++          Array(repeating: 0, count: outChannels * 3 * 3), .CPU, .NCHW(outChannels, 1, 3, 3))
++        padded[0..<channels, 0..<1, 0..<3, 0..<3] = tensor[0..<channels, 2..<3, 0..<3, 0..<3]
++          .contiguous()
++        return .final(padded)
++      }
++    } catch {
++      print("  ! reading \(key): \(error)")
++    }
++  }
++}
++
++var image = Tensor<Half>(.CPU, .NHWC(1, size, size, 4))
++for y in 0..<size {
++  for x in 0..<size {
++    for c in 0..<4 { image[0, y, x, c] = Half(referenceImage[0, y, x, c]) }
++  }
++}
++
++func relativeError(_ a: Tensor<Float>, _ b: Tensor<Float>, _ shape: [Int]) -> Double {
++  var difference = 0.0
++  var norm = 0.0
++  for y in 0..<shape[0] {
++    for x in 0..<shape[1] {
++      for c in 0..<shape[2] {
++        let d = Double(a[0, y, x, c] - b[0, y, x, c])
++        difference += d * d
++        norm += Double(b[0, y, x, c]) * Double(b[0, y, x, c])
++      }
++    }
++  }
++  return (difference / max(norm, 1e-30)).squareRoot()
++}
++
++try graph.withNoGrad {
++  let (_, encoder) = MingVAEEncoder(width: latentSize, height: latentSize)
++  let input = graph.variable(image.toGPU(0))
++  encoder.compile(inputs: input)
++  read(encoder, "encoder")
++  let encoded = encoder(inputs: input)[0].as(of: Half.self)
++  print("Encoder output: \(encoded.shape)")
++  // The first 16 channels are the mean, the rest the log variance.
++  let mean = encoded[0..<1, 0..<latentSize, 0..<latentSize, 0..<16].copied()
++  let latents = Tensor<Float>(from: mean.rawValue.toCPU())
++  var sum = 0.0
++  var squares = 0.0
++  for y in 0..<latentSize {
++    for x in 0..<latentSize {
++      for c in 0..<16 {
++        let value = Double(latents[0, y, x, c])
++        sum += value
++        squares += value * value
++      }
++    }
++  }
++  let count = Double(latentSize * latentSize * 16)
++  print(
++    "latents vs PyTorch: relative error "
++      + String(format: "%.5f", relativeError(latents, referenceTensor("latents"), [latentSize, latentSize, 16])))
++  print(
++    "Latents: mean \(String(format: "%.3f", sum / count)), std \(String(format: "%.3f", (squares / count - (sum / count) * (sum / count)).squareRoot()))"
++  )
++
++  let (_, decoder) = MingVAEDecoder(width: latentSize, height: latentSize)
++  decoder.compile(inputs: mean)
++  read(decoder, "decoder")
++  let decoded = decoder(inputs: mean)[0].as(of: Half.self)
++  print("Decoder output: \(decoded.shape)")
++  let result = Tensor<Float>(from: decoded.rawValue.toCPU())
++  print(
++    "decoded vs PyTorch: relative error "
++      + String(format: "%.5f", relativeError(result, referenceTensor("decoded"), [size, size, 4])))
++  for (channel, label) in ["red", "green", "blue", "alpha"].enumerated() {
++    var squareError = 0.0
++    for y in 0..<size {
++      for x in 0..<size {
++        // Back to 0...1 as a picture, clamped like the output is.
++        if channel < 3 && Float(image[0, y, x, 3]) <= 0 { continue }  // colour under transparency
++        let expected = (Double(image[0, y, x, channel]) + 1) / 2
++        let actual = min(max((Double(result[0, y, x, channel]) + 1) / 2, 0), 1)
++        squareError += (expected - actual) * (expected - actual)
++      }
++    }
++    let mse = squareError / Double(size * size)  // not divided by the opaque count: see below
++    print("\(label): PSNR \(String(format: "%.1f", 10 * log10(1 / max(mse, 1e-12)))) dB")
++  }
++}
+diff --git a/Apps/ModelConverter/Converter.swift b/Apps/ModelConverter/Converter.swift
+index 26ae6ad..2ec4fba 100644
+--- a/Apps/ModelConverter/Converter.swift
++++ b/Apps/ModelConverter/Converter.swift
+@@ -33,6 +33,16 @@ struct Converter: ParsableCommand {
+       "Convert the MiniMax H3 Image VAE: --file is its safetensors file (vae/diffusion_pytorch_model.safetensors of MiniMaxAI/MiniMax-H3-Image, or ComfyUI's minimax_h3_image_vae_fp16.safetensors)."
+   )
+   var h3ImageVae = false
++  @Flag(
++    help:
++      "Convert Ming-Image's text encoder: --file is ComfyUI's ming_image_0.1_ling_mini_2.0_bf16.safetensors (Comfy-Org/Ming-Image, text_encoders/). Writes the language model, connector and projections as <name>_f16.ckpt, and the tokenizer next to it."
++  )
++  var mingTextEncoder = false
++  @Flag(
++    help:
++      "Convert Ming-Image's VAE (4 channels, RGBA): --file is ComfyUI's ming_image_vae_bf16.safetensors (Comfy-Org/Ming-Image, vae/). Writes <name>_f16.ckpt."
++  )
++  var mingVae = false
+ 
+   private struct Specification: Codable {
+     var name: String
+@@ -60,6 +70,14 @@ struct Converter: ParsableCommand {
+       try convertMiniMaxH3ImageVAE()
+       return
+     }
++    if mingTextEncoder {
++      try convertMingTextEncoder()
++      return
++    }
++    if mingVae {
++      try convertMingVAE()
++      return
++    }
+     let fileName = Importer.cleanup(filename: name)
+     let importer = ModelImporter(
+       filePath: file, modelName: fileName,
+@@ -191,6 +209,13 @@ struct Converter: ParsableCommand {
+       }
+     case .zImage:
+       fatalError()
++    case .mingImage:
++      // The text encoder (Ling MoE + connector) and the 4-channel VAE are converted by their own
++      // steps once the engine has their graphs; until then only the DiT is converted.
++      textEncoder = "ming_image_ling_mini_2.0_i8x.ckpt"
++      if autoencoder == nil {
++        autoencoder = "ming_image_vae_f16.ckpt"
++      }
+     case .ernieImage:
+       textEncoder =
+         fileNames.first {
+@@ -306,6 +331,221 @@ struct Converter: ParsableCommand {
+     }
+   }
+ 
++  private enum MingTextEncoderError: Error {
++    case cannotOpenFile(String)
++    case missingTensor(String)
++  }
++
++  /// Converts Ming-Image's text encoder (the Ling MoE language model, the Qwen2 connector and the
++  /// projections) to the tensors `MingText.swift` reads: `__ming_text__[<parameter>]`. The ComfyUI
++  /// file stacks q, k and v and the experts' gate and up, the converter slices them. Vision tower,
++  /// `lm_head` and `linear_proj` are not needed for text-to-image and are left out.
++  private func convertMingTextEncoder() throws {
++    guard let safeTensors = SafeTensors(url: URL(fileURLWithPath: file)) else {
++      throw MingTextEncoderError.cannotOpenFile(file)
++    }
++    let states = safeTensors.states
++    let configuration = MingLingConfiguration.ming
++    let connector = MingConnectorConfiguration.ming
++    let graph = DynamicGraph()
++    let fileName = Importer.cleanup(filename: name)
++    let outputPath = URL(fileURLWithPath: outputDirectory)
++      .appendingPathComponent("\(fileName)_f16.ckpt").path
++    // Parameter names exist once a model is compiled; the shapes below only have to be valid.
++    let length = 16
++    func float32(_ shape: TensorShapeFormat) -> DynamicGraph.Tensor<Float> {
++      graph.variable(.GPU(0), shape, of: Float.self)
++    }
++    func half(_ shape: TensorShapeFormat) -> DynamicGraph.Tensor<FloatType> {
++      graph.variable(.GPU(0), shape, of: FloatType.self)
++    }
++    try graph.withNoGrad {
++      try graph.openStore(outputPath) { store in
++        store.removeAll()
++        try store.withTransaction {
++          func write(_ mapper: ModelWeightMapper) throws {
++            for (key, element) in mapper(.diffusers).sorted(by: { $0.key < $1.key }) {
++              let parts = key.split(separator: "#", maxSplits: 1).map(String.init)
++              guard let descriptor = states[parts[0]] else {
++                throw MingTextEncoderError.missingTensor(parts[0])
++              }
++              try safeTensors.with(descriptor) { source in
++                var tensor = Tensor<FloatType>(from: source)
++                if parts.count == 2 {
++                  let hidden = configuration.hiddenSize
++                  let queryRows = configuration.heads * configuration.headDimension
++                  let keyRows = configuration.keyValueHeads * configuration.headDimension
++                  switch parts[1] {
++                  case "q": tensor = tensor[0..<queryRows, 0..<hidden].copied()
++                  case "k": tensor = tensor[queryRows..<(queryRows + keyRows), 0..<hidden].copied()
++                  case "v":
++                    tensor = tensor[(queryRows + keyRows)..<(queryRows + 2 * keyRows), 0..<hidden]
++                      .copied()
++                  case "gate", "up":
++                    let intermediate = configuration.expertIntermediateSize
++                    let stacked = tensor.reshaped(
++                      .HWC(configuration.experts, 2 * intermediate, hidden))
++                    let start = parts[1] == "gate" ? 0 : intermediate
++                    tensor = stacked[
++                      0..<configuration.experts, start..<(start + intermediate), 0..<hidden
++                    ].copied()
++                  default: fatalError("Unknown slice \(parts[1])")
++                  }
++                }
++                element.write(
++                  graph: graph, to: store, tensor: tensor, format: element.format,
++                  isDiagonalUp: false, isDiagonalDown: false
++                ) { "__ming_text__[\($0)]" }
++              }
++            }
++          }
++          // Token embedding and the final norm.
++          do {
++            let (mapper, model) = MingLingEmbedding(
++              FloatType.self, tokenLength: length, configuration: configuration)
++            let tokens = graph.variable(.GPU(0), .C(length), of: Int32.self)
++            model.compile(
++              inputs: tokens, float32(.WC(length, 1)), float32(.WC(length, configuration.hiddenSize)))
++            try write(mapper)
++          }
++          do {
++            let (mapper, model) = MingLingFinalNorm(configuration: configuration)
++            model.compile(inputs: float32(.WC(length, configuration.hiddenSize)))
++            try write(mapper)
++          }
++          for layer in 0..<configuration.layers {
++            do {
++              let (mapper, model) = MingLingAttentionHalf(
++                FloatType.self, layer: layer, tokenLength: length, usesFlashAttention: true,
++                configuration: configuration)
++              model.compile(
++                inputs: float32(.WC(length, configuration.hiddenSize)),
++                half(.NHWC(1, length, 1, configuration.headDimension)),
++                half(.NHWC(1, 1, length, length)))
++              try write(mapper)
++            }
++            if layer < configuration.denseLayers {
++              let (mapper, model) = MingLingDenseHalf(
++                FloatType.self, layer: layer, configuration: configuration)
++              model.compile(
++                inputs: float32(.WC(length, configuration.hiddenSize)),
++                float32(.WC(length, configuration.hiddenSize)))
++              try write(mapper)
++            } else {
++              let (mapper, model) = MingLingMoEHalf(
++                layer: layer, tokenLength: length, configuration: configuration)
++              let selected = graph.variable(
++                .GPU(0), .WC(length, configuration.expertsPerToken), of: Int32.self)
++              model.compile(
++                inputs: float32(.WC(length, configuration.hiddenSize)),
++                float32(.WC(length, configuration.hiddenSize)),
++                float32(.WC(length, configuration.experts)), selected)
++              try write(mapper)
++              // The routing runs on the host, which needs the experts' score biases.
++              for gate in ["gate", "image_gate"] {
++                let key = "thinker.layers.\(layer).mlp.\(gate).expert_bias"
++                guard let descriptor = states[key] else {
++                  throw MingTextEncoderError.missingTensor(key)
++                }
++                try safeTensors.with(descriptor) {
++                  store.write("layers.\(layer).\(gate).expert_bias", tensor: Tensor<Float>(from: $0))
++                }
++              }
++            }
++            print("Converted layer \(layer)")
++          }
++          // Connector, proj_in, proj_out.
++          do {
++            let (mapper, model) = MingConnector(
++              FloatType.self, tokenLength: 256, usesFlashAttention: true, configuration: connector)
++            model.compile(
++              inputs: half(.WC(256, connector.inputSize)),
++              half(.NHWC(1, 256, 1, connector.headDimension)))
++            try write(mapper)
++          }
++          // The second caption stream.
++          do {
++            let (mapper, model) = MingDirectVLMProjection(FloatType.self)
++            model.compile(inputs: half(.WC(length, 3 * configuration.hiddenSize)))
++            try write(mapper)
++          }
++          // The learnable queries.
++          guard let queries = states["query_tokens"] else {
++            throw MingTextEncoderError.missingTensor("query_tokens")
++          }
++          try safeTensors.with(queries) {
++            store.write("query_tokens", tensor: Tensor<FloatType>(from: $0))
++          }
++        }
++      }
++    }
++    // The tokenizer is stored as a tensor of bytes.
++    let tokenizerPath = URL(fileURLWithPath: outputDirectory)
++      .appendingPathComponent("\(fileName)_tokenizer.json")
++    try Self.safetensorsBytes(of: "tokenizer_json", in: URL(fileURLWithPath: file)).write(
++      to: tokenizerPath)
++    print("Wrote \(outputPath) and \(tokenizerPath.path)")
++  }
++
++  /// Converts Ming-Image's VAE with the Wan VAE graph (RGBA on both ends): `__encoder__[...]`,
++  /// `__decoder__[...]`, as the engine reads them.
++  private func convertMingVAE() throws {
++    guard let safeTensors = SafeTensors(url: URL(fileURLWithPath: file)) else {
++      throw MingTextEncoderError.cannotOpenFile(file)
++    }
++    let states = safeTensors.states
++    let graph = DynamicGraph()
++    let fileName = Importer.cleanup(filename: name)
++    let outputPath = URL(fileURLWithPath: outputDirectory)
++      .appendingPathComponent("\(fileName)_f16.ckpt").path
++    let side = 64
++    var written = Set<String>()
++    try graph.withNoGrad {
++      let (decoderMapper, decoder) = MingVAEDecoder(width: side / 8, height: side / 8)
++      let (encoderMapper, encoder) = MingVAEEncoder(width: side / 8, height: side / 8)
++      decoder.compile(inputs: graph.variable(.GPU(0), .NHWC(1, side / 8, side / 8, 16), of: FloatType.self))
++      encoder.compile(inputs: graph.variable(.GPU(0), .NHWC(1, side, side, 4), of: FloatType.self))
++      try graph.openStore(outputPath) { store in
++        store.removeAll()
++        try store.withTransaction {
++          for (mapper, prefix) in [(decoderMapper, "__decoder__"), (encoderMapper, "__encoder__")] {
++            for (key, element) in mapper(.diffusers).sorted(by: { $0.key < $1.key }) {
++              guard let descriptor = states[key] else { throw MingTextEncoderError.missingTensor(key) }
++              written.insert(key)
++              try safeTensors.with(descriptor) { source in
++                element.write(
++                  graph: graph, to: store, tensor: Tensor<FloatType>(from: source),
++                  format: element.format, isDiagonalUp: false, isDiagonalDown: false
++                ) { "\(prefix)[\($0)]" }
++              }
++            }
++          }
++        }
++      }
++    }
++    let unused = Set(states.keys).subtracting(written)
++    print("Wrote \(outputPath): \(written.count) of \(states.count) tensors used")
++    if !unused.isEmpty {
++      print("Not used: \(unused.sorted().prefix(10))")
++    }
++  }
++
++  /// The raw bytes of one tensor of a safetensors file (the header is 8 bytes of length and JSON).
++  private static func safetensorsBytes(of name: String, in url: URL) throws -> Data {
++    let handle = try FileHandle(forReadingFrom: url)
++    defer { try? handle.close() }
++    let lengthBytes = try handle.read(upToCount: 8) ?? Data()
++    let headerLength = lengthBytes.withUnsafeBytes { Int($0.loadUnaligned(as: UInt64.self)) }
++    let header = try handle.read(upToCount: headerLength) ?? Data()
++    guard
++      let json = try JSONSerialization.jsonObject(with: header) as? [String: Any],
++      let entry = json[name] as? [String: Any],
++      let offsets = entry["data_offsets"] as? [Int], offsets.count == 2
++    else { throw MingTextEncoderError.missingTensor(name) }
++    try handle.seek(toOffset: UInt64(8 + headerLength + offsets[0]))
++    return try handle.read(upToCount: offsets[1] - offsets[0]) ?? Data()
++  }
++
+   private enum Fibo2TextEncoderError: Error {
+     case cannotOpenFile(String)
+     case missingTensor(String)
+diff --git a/Apps/QuantI8x/Quantizer.swift b/Apps/QuantI8x/Quantizer.swift
+index 36479d7..eaa00f2 100644
+--- a/Apps/QuantI8x/Quantizer.swift
++++ b/Apps/QuantI8x/Quantizer.swift
+@@ -1,6 +1,7 @@
+ // Row-wise 8-bit ("8-bit S", i8x) variant of ModelQuantizer, used by the Fibo converter app.
+ import ArgumentParser
+ import Diffusion
++import Foundation
+ import NNC
+ 
+ @main
+@@ -20,7 +21,7 @@ struct Quantizer: ParsableCommand {
+       hidream_o1,
+       qwen_image, wan_v2.2_5b, z_image, ernie_image, flux2, flux2_9b, flux2_4b, flux3_5b, fibo2,
+       cosmos2.5_2b, cosmos2.5_2.9b, ltx2, ltx2.3,
+-      seedvr2_3b, seedvr2_7b, ideogram_4, krea_2, moss_image
++      seedvr2_3b, seedvr2_7b, ideogram_4, krea_2, moss_image, ming_image
+       """)
+   var modelVersion: String
+ 
+@@ -54,14 +55,28 @@ struct Quantizer: ParsableCommand {
+             continue
+           }
+ 
+-          // First convert the tensor to FP16, and then to q8p.
+-          let fp16 = Tensor<FloatType>(from: tensor)
++          // First convert the tensor to FP16, and then to q8p. BFloat16 goes through Float: a
++          // direct BFloat16 -> Float16 conversion on the CPU produces zeros.
++          let fp16: Tensor<FloatType>
++          if tensor.dataType == .BFloat16 {
++            fp16 = Tensor<FloatType>(from: Tensor<Float>(from: tensor))
++          } else {
++            fp16 = Tensor<FloatType>(from: tensor)
++          }
+           let shape = fp16.shape
+           let squeezedDims = shape.reduce(0) { $1 > 1 ? 1 + $0 : $0 }
+           if textEncoder {
+             // Embeddings are a lookup, and the vision tower is small and reads pixels, so both
+             // stay FP16. Norms only get compressed.
+-            if key.contains("tok_embeddings") || key.hasPrefix("__vision_model__") {
++            // Ming-Image's encoder also keeps its FP32 score biases, the learnable queries, the
++            // routers (they pick experts) and the small projections around the connector as they are.
++            if tensor.dataType == .Float32 && squeezedDims <= 1 {
++              $0.write(key, tensor: tensor)
++            } else if key.contains("tok_embeddings") || key.hasPrefix("__vision_model__")
++              || key.contains("query_tokens") || key.contains("text_gate")
++              || key.contains("image_gate") || key.contains("proj_in") || key.contains("proj_out")
++              || key.contains("proj_directvlm")
++            {
+               $0.write(key, tensor: fp16)
+             } else if squeezedDims > 1 {
+               $0.write(key, tensor: fp16, codec: [.i8x, .ezm7])
+@@ -283,6 +298,21 @@ struct Quantizer: ParsableCommand {
+                 $0.write(key, tensor: fp16, codec: .ezm7)
+               }
+             }
++          case .mingImage:
++            // The DiT is Z-Image's graph (same tensor names): embedders and the final projection
++            // stay FP16, every other matrix is row-wise 8-bit, vectors ezm7.
++            if key.contains("embedder") || key.contains("pos_embed")
++              || key.contains("-linear_final-")
++            {
++              $0.write(key, tensor: fp16)
++            } else if squeezedDims > 1 {
++              // MING_FP16_ONLY keeps the matrices in FP16 (lossless compression), to tell
++              // quantization error from FP16 arithmetic error.
++              let lossless = ProcessInfo.processInfo.environment["MING_FP16_ONLY"] != nil
++              $0.write(key, tensor: fp16, codec: lossless ? [.ezm7] : [.i8x, .ezm7])
++            } else {
++              $0.write(key, tensor: fp16, codec: .ezm7)
++            }
+           case .ltx2, .ltx2_3, .longcatVideoAvatar1_5, .minimaxH3:
+             fatalError()
+           case .mossImage:
+diff --git a/Libraries/DataModels/Sources/DeviceCapability.swift b/Libraries/DataModels/Sources/DeviceCapability.swift
+index 4771b4a..1ee1307 100644
+--- a/Libraries/DataModels/Sources/DeviceCapability.swift
++++ b/Libraries/DataModels/Sources/DeviceCapability.swift
+@@ -863,7 +863,7 @@ public struct DeviceCapability {
+       else {
+         return false
+       }
+-    case .qwenImage, .hiDreamO1:
++    case .qwenImage, .hiDreamO1, .mingImage:
+       guard
+         (!isUltraPerformance && !(isMaxPerformance && is8BitModel)) || force
+       else {
+diff --git a/Libraries/ModelOp/Sources/ControlNetImporter.swift b/Libraries/ModelOp/Sources/ControlNetImporter.swift
+index 19ad220..259b11a 100644
+--- a/Libraries/ModelOp/Sources/ControlNetImporter.swift
++++ b/Libraries/ModelOp/Sources/ControlNetImporter.swift
+@@ -270,7 +270,7 @@ public final class ControlNetImporter {
+       .wurstchenStageC, .wurstchenStageB, .hunyuanVideo, .wan21_1_3b, .wan21_14b, .hiDreamI1,
+       .hiDreamO1, .qwenImage2_1, .qwenImage, .cosmos2_5_2b, .cosmos2_5_2_9b, .wan22_5b, .zImage,
+       .ernieImage, .flux2,
+-      .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .ltx2, .ltx2_3, .seedvr2_3b, .seedvr2_7b,
++      .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .mingImage, .ltx2, .ltx2_3, .seedvr2_3b, .seedvr2_7b,
+       .ideogram4, .krea2:
+       fatalError()
+     }
+@@ -371,7 +371,7 @@ public final class ControlNetImporter {
+       .wurstchenStageC, .wurstchenStageB, .hunyuanVideo, .wan21_1_3b, .wan21_14b, .hiDreamI1,
+       .hiDreamO1, .qwenImage2_1, .qwenImage, .cosmos2_5_2b, .cosmos2_5_2_9b, .wan22_5b, .zImage,
+       .ernieImage, .flux2,
+-      .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .ltx2, .ltx2_3, .seedvr2_3b, .seedvr2_7b,
++      .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .mingImage, .ltx2, .ltx2_3, .seedvr2_3b, .seedvr2_7b,
+       .ideogram4, .krea2:
+       fatalError()
+     }
+@@ -423,7 +423,7 @@ public final class ControlNetImporter {
+           .kandinsky21, .svdI2v, .wurstchenStageC, .wurstchenStageB, .hunyuanVideo, .wan21_1_3b,
+           .wan21_14b, .hiDreamI1, .hiDreamO1, .qwenImage2_1, .qwenImage, .cosmos2_5_2b,
+           .cosmos2_5_2_9b, .wan22_5b, .zImage, .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2,
+-          .mossImage, .ltx2, .ltx2_3,
++          .mossImage, .mingImage, .ltx2, .ltx2_3,
+           .seedvr2_3b,
+           .seedvr2_7b, .ideogram4, .krea2:
+           fatalError()
+diff --git a/Libraries/ModelOp/Sources/LoRAExporter.swift b/Libraries/ModelOp/Sources/LoRAExporter.swift
+index c4d5b2a..9c1850e 100644
+--- a/Libraries/ModelOp/Sources/LoRAExporter.swift
++++ b/Libraries/ModelOp/Sources/LoRAExporter.swift
+@@ -21,7 +21,7 @@ public enum LoRAExporter {
+     var metadata = [String: String]()
+     metadata["name"] = humanName
+     switch version {
+-    case .mossImage, .longcatVideoAvatar1_5, .minimaxH3, .minimaxH3Image, .fibo2:
++    case .mossImage, .mingImage, .longcatVideoAvatar1_5, .minimaxH3, .minimaxH3Image, .fibo2:
+       fatalError()
+     case .v1:
+       metadata["version"] = "v1"
+@@ -196,7 +196,7 @@ public enum LoRAExporter {
+       .wurstchenStageB, .hunyuanVideo, .wan21_1_3b, .wan21_14b, .hiDreamI1, .hiDreamO1,
+       .qwenImage2_1, .qwenImage, .cosmos2_5_2b, .cosmos2_5_2_9b, .wan22_5b, .zImage,
+       .ernieImage, .flux2, .flux2_9b,
+-      .flux2_4b, .flux3_5b, .mossImage, .ltx2, .ltx2_3, .seedvr2_3b, .seedvr2_7b, .ideogram4,
++      .flux2_4b, .flux3_5b, .mossImage, .mingImage, .ltx2, .ltx2_3, .seedvr2_3b, .seedvr2_7b, .ideogram4,
+       .krea2:
+       textEncoderKeys = []
+       textEncoderKeysMapping = [:]
+diff --git a/Libraries/ModelOp/Sources/LoRAImporter.swift b/Libraries/ModelOp/Sources/LoRAImporter.swift
+index 4ca552f..8daf580 100644
+--- a/Libraries/ModelOp/Sources/LoRAImporter.swift
++++ b/Libraries/ModelOp/Sources/LoRAImporter.swift
+@@ -50,7 +50,7 @@ public enum LoRAImporter {
+     let unetMapper: ModelWeightMapper
+     let unetFixedMapper: ModelWeightMapper
+     switch version {
+-    case .longcatVideoAvatar1_5, .fibo2:
++    case .longcatVideoAvatar1_5, .fibo2, .mingImage:
+       fatalError()
+     case .mossImage:
+       (unetMapper, unet) = MOSSImage(
+@@ -305,7 +305,7 @@ public enum LoRAImporter {
+       let inputDim: Int
+       let conditionalLength: Int
+       switch version {
+-      case .longcatVideoAvatar1_5, .fibo2:
++      case .longcatVideoAvatar1_5, .fibo2, .mingImage:
+         fatalError()
+       case .mossImage:
+         inputDim = 32
+@@ -395,7 +395,7 @@ public enum LoRAImporter {
+       let isCfgEnabled: Bool
+       let isGuidanceEmbedEnabled: Bool
+       switch version {
+-      case .longcatVideoAvatar1_5, .fibo2:
++      case .longcatVideoAvatar1_5, .fibo2, .mingImage:
+         fatalError()
+       case .mossImage:
+         isCfgEnabled = false
+@@ -786,7 +786,7 @@ public enum LoRAImporter {
+       // These values doesn't matter, it won't affect the model shape, just the input vector.
+       let vectors: [DynamicGraph.Tensor<FloatType>]
+       switch version {
+-      case .longcatVideoAvatar1_5, .fibo2:
++      case .longcatVideoAvatar1_5, .fibo2, .mingImage:
+         fatalError()
+       case .sdxlBase, .ssd1b:
+         vectors = [graph.variable(.CPU, .WC(2, 2816), of: FloatType.self)]
+@@ -804,7 +804,7 @@ public enum LoRAImporter {
+         fatalError()
+       }
+       switch version {
+-      case .longcatVideoAvatar1_5, .fibo2:
++      case .longcatVideoAvatar1_5, .fibo2, .mingImage:
+         fatalError()
+       case .mossImage:
+         // The refined text and the modulations are in FP32, they are appended when compiling.
+@@ -1689,7 +1689,7 @@ public enum LoRAImporter {
+     var textModelMapping1: ModelWeightMapping
+     var textModelMapping2: ModelWeightMapping
+     switch modelVersion {
+-    case .longcatVideoAvatar1_5, .fibo2:
++    case .longcatVideoAvatar1_5, .fibo2, .mingImage:
+       fatalError()
+     case .v1:
+       textModelMapping1 = StableDiffusionMapping.CLIPTextModel
+@@ -1972,7 +1972,7 @@ public enum LoRAImporter {
+     try graph.openStore(outputPath) { store in
+       store.removeAll()
+       switch modelVersion {
+-      case .longcatVideoAvatar1_5, .fibo2:
++      case .longcatVideoAvatar1_5, .fibo2, .mingImage:
+         fatalError()
+       case .minimaxH3, .minimaxH3Image:
+         break
+@@ -2176,7 +2176,7 @@ public enum LoRAImporter {
+       let modelPrefix: String
+       let modelPrefixFixed: String
+       switch modelVersion {
+-      case .longcatVideoAvatar1_5, .fibo2:
++      case .longcatVideoAvatar1_5, .fibo2, .mingImage:
+         fatalError()
+       case .v1, .v2, .kandinsky21, .sdxlBase, .sdxlRefiner, .ssd1b, .svdI2v:
+         modelPrefix = "unet"
+diff --git a/Libraries/ModelOp/Sources/ModelImporter.swift b/Libraries/ModelOp/Sources/ModelImporter.swift
+index 83357b6..51d3394 100644
+--- a/Libraries/ModelOp/Sources/ModelImporter.swift
++++ b/Libraries/ModelOp/Sources/ModelImporter.swift
+@@ -206,6 +206,12 @@ public final class ModelImporter {
+     var isZImage = stateDict.keys.contains {
+       $0.contains("layers.29.feed_forward.w3.")
+     }
++    // Ming-Image's DiT is Z-Image's graph and tensor names, without the two learned pad tokens.
++    let isMingImage =
++      stateDict.keys.contains { $0.contains("layers.29.feed_forward.w3.") }
++      && !stateDict.keys.contains { $0 == "x_pad_token" || $0.hasSuffix(".x_pad_token") }
++      && !stateDict.keys.contains { $0 == "cap_pad_token" || $0.hasSuffix(".cap_pad_token") }
++      && stateDict.keys.contains { $0.contains("all_x_embedder.2-1.") }
+     var isErnieImage = stateDict.keys.contains {
+       $0.contains("layers.35.mlp.linear_fc2.") || $0.contains("layers_35_mlp_linear_fc2")
+     }
+@@ -470,6 +476,15 @@ public final class ModelImporter {
+       // 478 + 305 tensors across the two diffusers shards.
+       expectedTotalAccess = 783
+       isDiffusersFormat = true
++    } else if isZImage && isMingImage {
++      modelVersion = .mingImage
++      modifier = .none
++      inputDim = 16
++      // Z-Image's 1652 minus its two learned pad tokens (x_pad_token, cap_pad_token).
++      expectedTotalAccess = 1652
++      isDiffusersFormat = stateDict.keys.contains {
++        $0.contains("layers.29.attention.to_out.0.")
++      }
+     } else if isZImage {
+       modelVersion = .zImage
+       modifier = .none
+@@ -647,7 +662,7 @@ public final class ModelImporter {
+         throw Error.noTextEncoder
+       case .hiDreamI1, .hiDreamO1, .qwenImage2_1:
+         throw Error.noTextEncoder
+-      case .zImage:
++      case .zImage, .mingImage:
+         throw Error.noTextEncoder
+       case .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage:
+         throw Error.noTextEncoder
+@@ -726,7 +741,7 @@ public final class ModelImporter {
+               "\(modelName)_open_clip_vit_bigg14_f16.ckpt")
+           case .sd3, .sd3Large, .pixart, .auraflow, .flux1, .kandinsky21, .svdI2v, .wurstchenStageC,
+             .wurstchenStageB, .hunyuanVideo, .wan21_1_3b, .wan21_14b, .hiDreamI1, .hiDreamO1,
+-            .qwenImage2_1, .qwenImage, .cosmos2_5_2b, .cosmos2_5_2_9b, .wan22_5b, .zImage,
++            .qwenImage2_1, .qwenImage, .cosmos2_5_2b, .cosmos2_5_2_9b, .wan22_5b, .zImage, .mingImage,
+             .ernieImage, .flux2,
+             .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .ltx2, .ltx2_3, .seedvr2_3b, .seedvr2_7b,
+             .ideogram4,
+@@ -773,7 +788,7 @@ public final class ModelImporter {
+             case .sd3, .sd3Large, .pixart, .auraflow, .flux1, .kandinsky21, .svdI2v,
+               .wurstchenStageC, .wurstchenStageB, .hunyuanVideo, .wan21_1_3b, .wan21_14b,
+               .hiDreamI1, .hiDreamO1, .qwenImage2_1, .qwenImage, .cosmos2_5_2b,
+-              .cosmos2_5_2_9b, .wan22_5b, .zImage, .ernieImage, .flux2, .flux2_9b, .flux2_4b,
++              .cosmos2_5_2_9b, .wan22_5b, .zImage, .mingImage, .ernieImage, .flux2, .flux2_9b, .flux2_4b,
+               .flux3_5b, .fibo2, .mossImage, .ltx2, .ltx2_3,
+               .seedvr2_3b,
+               .seedvr2_7b,
+@@ -931,7 +946,7 @@ public final class ModelImporter {
+     case .qwenImage:
+       conditionalLength = 3854
+       batchSize = 1
+-    case .zImage:
++    case .zImage, .mingImage:
+       conditionalLength = 2560
+       batchSize = 1
+     case .ernieImage:
+@@ -1056,7 +1071,7 @@ public final class ModelImporter {
+           vectors = [graph.variable(.CPU, .WC(batchSize, 768), of: FloatType.self)]
+         case .wurstchenStageC, .wurstchenStageB, .pixart, .sd3, .sd3Large, .auraflow, .flux1,
+           .hunyuanVideo, .wan21_1_3b, .wan21_14b, .hiDreamI1, .hiDreamO1, .qwenImage2_1, .qwenImage,
+-          .cosmos2_5_2b, .cosmos2_5_2_9b, .wan22_5b, .zImage, .ernieImage, .flux2, .flux2_9b,
++          .cosmos2_5_2b, .cosmos2_5_2_9b, .wan22_5b, .zImage, .mingImage, .ernieImage, .flux2, .flux2_9b,
+           .flux2_4b, .flux3_5b, .fibo2,
+           .mossImage,
+           .ltx2,
+@@ -1186,7 +1201,7 @@ public final class ModelImporter {
+           ).map {
+             graph.variable(.CPU, format: .NHWC, shape: $0, of: FloatType.self)
+           }
+-      case .zImage:
++      case .zImage, .mingImage:
+         cArr =
+           [
+             graph.variable(
+@@ -1540,7 +1555,7 @@ public final class ModelImporter {
+         (unetFixedMapper, unetFixed) = AuraFlowFixed(
+           batchSize: (1, 1), channels: 3072, layers: (4, 32),
+           of: FloatType.self)
+-      case .zImage:
++      case .zImage, .mingImage:
+         (unet, unetMapper) = ZImage(
+           batchSize: 1, height: 64, width: 64, textLength: 32, channels: 3840, layers: 30,
+           activationQkScaling: [:], activationProjScaling: [:], activationFfnProjUpScaling: [:],
+@@ -1772,7 +1787,7 @@ public final class ModelImporter {
+             graph.variable(.CPU, .WC(1, 256), of: FloatType.self),
+           ]
+         tEmb = nil
+-      case .zImage:
++      case .zImage, .mingImage:
+         crossattn = [
+           graph.variable(.CPU, .HWC(1, 32, 2560), of: FloatType.self),
+           graph.variable(
+@@ -1971,7 +1986,7 @@ public final class ModelImporter {
+             stateDict[String(key.dropFirst(6))] = value
+           }
+         }
+-      } else if modelVersion == .zImage {
++      } else if modelVersion == .zImage || modelVersion == .mingImage {
+         // Remove the model.diffusion_model / model prefix.
+         for (key, value) in stateDict {
+           if key.hasPrefix("model.diffusion_model.") {
+@@ -2176,7 +2191,7 @@ public final class ModelImporter {
+             modelPrefixFixed = "dit"
+           case .pixart, .sd3, .sd3Large, .flux1, .hunyuanVideo, .wan21_14b, .wan21_1_3b, .hiDreamI1,
+             .hiDreamO1, .wan22_5b, .qwenImage, .cosmos2_5_2b,
+-            .cosmos2_5_2_9b, .auraflow, .zImage, .ernieImage, .flux2, .flux2_9b, .flux2_4b,
++            .cosmos2_5_2_9b, .auraflow, .zImage, .mingImage, .ernieImage, .flux2, .flux2_9b, .flux2_4b,
+             .flux3_5b, .ltx2, .ltx2_3,
+             .longcatVideoAvatar1_5,
+             .ideogram4, .krea2, .minimaxH3, .minimaxH3Image:
+@@ -2582,6 +2597,11 @@ public final class ModelImporter {
+           if $0.keys.count != 713 {
+             throw Error.tensorWritesFailed
+           }
++        case .mingImage:
++          // Z-Image's 713 without x_pad_token and cap_pad_token.
++          if $0.keys.count != 711 {
++            throw Error.tensorWritesFailed
++          }
+         case .ernieImage:
+           if $0.keys.count != 421 {
+             throw Error.tensorWritesFailed
+@@ -2883,6 +2903,10 @@ extension ModelImporter {
+       textEncoder = fileNames.first {
+         $0.hasSuffix("_qwen_3_vl_4b_instruct_f16.ckpt")
+       }
++    case .mingImage:
++      textEncoder = fileNames.first {
++        $0.hasSuffix("_ling_mini_2.0_i8x.ckpt") || $0.hasSuffix("_ling_mini_2.0_f16.ckpt")
++      }
+     case .ernieImage:
+       textEncoder = fileNames.first {
+         $0.hasSuffix("_ministral_3_3b_f16.ckpt")
+@@ -3230,12 +3254,15 @@ extension ModelImporter {
+       specification.objective = .u(conditionScale: 1000)
+       specification.noiseDiscretization = .rf(
+         .init(sigmaMin: 0, sigmaMax: 1, conditionScale: 1_000))
+-    case .zImage:
++    case .zImage, .mingImage:
+       if specification.textEncoder == nil {
+-        specification.textEncoder = "qwen_3_vl_4b_instruct_q8p.ckpt"
++        specification.textEncoder =
++          modelVersion == .mingImage
++          ? "ming_image_ling_mini_2.0_i8x.ckpt" : "qwen_3_vl_4b_instruct_q8p.ckpt"
+       }
+       if specification.autoencoder == nil {
+-        specification.autoencoder = "flux_1_vae_f16.ckpt"
++        specification.autoencoder =
++          modelVersion == .mingImage ? "ming_image_vae_f16.ckpt" : "flux_1_vae_f16.ckpt"
+       }
+       specification.objective = .u(conditionScale: 1000)
+       specification.noiseDiscretization = .rf(
+diff --git a/Libraries/ModelZoo/Sources/ComputeUnits.swift b/Libraries/ModelZoo/Sources/ComputeUnits.swift
+index c27b834..d9b6ba5 100644
+--- a/Libraries/ModelZoo/Sources/ComputeUnits.swift
++++ b/Libraries/ModelZoo/Sources/ComputeUnits.swift
+@@ -95,7 +95,7 @@ public enum ComputeUnits {
+     switch context.modelVersion {
+     case .v1, .v2, .kandinsky21, .sdxlBase, .sdxlRefiner, .ssd1b, .wurstchenStageC,
+       .wurstchenStageB, .sd3, .pixart, .auraflow, .sd3Large, .flux1, .qwenImage, .qwenImage2_1,
+-      .zImage, .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .cosmos2_5_2b,
++      .zImage, .mingImage, .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .cosmos2_5_2b,
+       .cosmos2_5_2_9b,
+       .hiDreamI1,
+       .hiDreamO1,
+@@ -147,7 +147,7 @@ public enum ComputeUnits {
+       return 512
+     case .hunyuanVideo:
+       return 256
+-    case .qwenImage, .qwenImage2_1, .zImage, .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2,
++    case .qwenImage, .qwenImage2_1, .zImage, .mingImage, .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2,
+       .mossImage,
+       .ideogram4:
+       return 512
+@@ -465,7 +465,7 @@ public enum ComputeUnits {
+         timesteps: 1, batchSize: 1, textLength: baseTokenLength, channels: 3072, layers: 60,
+         referenceSequenceLength: referenceSequenceLength)
+       return (main: mainCount * batchSize, fixed: fixedCount * batchSize)
+-    case .zImage:
++    case .zImage, .mingImage:
+       let mainCount = ZImageInstructionCount(
+         batchSize: 1, height: startHeight, width: startWidth, textLength: baseTokenLength,
+         channels: 3840, layers: 30)
+diff --git a/Libraries/ModelZoo/Sources/LoRAZoo.swift b/Libraries/ModelZoo/Sources/LoRAZoo.swift
+index fe6a476..811c06b 100644
+--- a/Libraries/ModelZoo/Sources/LoRAZoo.swift
++++ b/Libraries/ModelZoo/Sources/LoRAZoo.swift
+@@ -441,6 +441,8 @@ public struct LoRAZoo: DownloadZoo {
+       return " (Fibo 2.0)"
+     case .mossImage:
+       return " (MOSS Image)"
++    case .mingImage:
++      return " (Ming Image)"
+     case .cosmos2_5_2b:
+       return " (Cosmos 2.5 2B)"
+     case .cosmos2_5_2_9b:
+diff --git a/Libraries/ModelZoo/Sources/ModelZoo.swift b/Libraries/ModelZoo/Sources/ModelZoo.swift
+index de202bf..15a54a9 100644
+--- a/Libraries/ModelZoo/Sources/ModelZoo.swift
++++ b/Libraries/ModelZoo/Sources/ModelZoo.swift
+@@ -77,6 +77,8 @@ public struct ModelZoo: DownloadZoo {
+       return "Fibo 2.0"
+     case .mossImage:
+       return "MOSS Image"
++    case .mingImage:
++      return "Ming Image"
+     case .cosmos2_5_2b:
+       return "Cosmos 2.5 2B"
+     case .cosmos2_5_2_9b:
+@@ -2944,7 +2946,7 @@ public struct ModelZoo: DownloadZoo {
+       return .u(conditionScale: 1)
+     case .sd3, .sd3Large, .auraflow, .flux1, .hunyuanVideo, .wan21_1_3b, .wan21_14b, .hiDreamI1,
+       .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage, .flux2, .flux2_9b, .flux2_4b,
+-      .flux3_5b, .fibo2, .mossImage,
++      .flux3_5b, .fibo2, .mossImage, .mingImage,
+       .ltx2, .ltx2_3, .ernieImage, .seedvr2_3b, .seedvr2_7b, .ideogram4, .krea2,
+       .longcatVideoAvatar1_5, .minimaxH3, .minimaxH3Image:
+       return .u(conditionScale: 1000)
+@@ -2960,7 +2962,7 @@ public struct ModelZoo: DownloadZoo {
+     case .kandinsky21, .sdxlBase, .sdxlRefiner, .v1, .v2, .ssd1b, .wurstchenStageC,
+       .wurstchenStageB, .sd3, .sd3Large, .pixart, .auraflow, .flux1, .hunyuanVideo, .wan21_1_3b,
+       .wan21_14b, .hiDreamI1, .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage,
+-      .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .cosmos2_5_2b,
++      .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .mingImage, .cosmos2_5_2b,
+       .cosmos2_5_2_9b, .ltx2,
+       .ltx2_3,
+       .seedvr2_3b,
+@@ -2999,7 +3001,7 @@ public struct ModelZoo: DownloadZoo {
+       return .rf(.init(sigmaMin: 0, sigmaMax: 1, conditionScale: 1))
+     case .sd3, .sd3Large, .auraflow, .flux1, .hunyuanVideo, .wan21_1_3b, .wan21_14b, .hiDreamI1,
+       .hiDreamO1, .qwenImage, .wan22_5b, .zImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2,
+-      .mossImage, .ltx2,
++      .mossImage, .mingImage, .ltx2,
+       .ltx2_3,
+       .ernieImage, .seedvr2_3b, .seedvr2_7b, .ideogram4, .krea2,
+       .longcatVideoAvatar1_5, .minimaxH3, .minimaxH3Image:
+@@ -3025,7 +3027,7 @@ public struct ModelZoo: DownloadZoo {
+     case .hiDreamI1:
+       return 128
+     case .hiDreamO1, .hunyuanVideo, .qwenImage, .qwenImage2_1, .zImage, .ernieImage, .flux2,
+-      .flux3_5b, .fibo2, .mossImage, .ltx2, .ltx2_3, .seedvr2_3b, .seedvr2_7b, .ideogram4, .krea2:
++      .flux3_5b, .fibo2, .mossImage, .mingImage, .ltx2, .ltx2_3, .seedvr2_3b, .seedvr2_7b, .ideogram4, .krea2:
+       return 0
+     case .wan21_1_3b, .wan21_14b, .wan22_5b, .flux2_9b, .flux2_4b, .cosmos2_5_2b,
+       .cosmos2_5_2_9b,
+@@ -3094,6 +3096,9 @@ public struct ModelZoo: DownloadZoo {
+       return (nil, nil, 1.5305, 0.0609, nil, nil)
+     case .flux1, .hiDreamI1, .zImage:
+       return (nil, nil, 0.3611, 0.11590, nil, nil)
++    case .mingImage:
++      // AutoencoderKLQwenImage (4 channels): scaling_factor 8.0064, shift_factor 0.
++      return (nil, nil, 8.0064, 0.0, nil, nil)
+     case .seedvr2_3b, .seedvr2_7b:
+       return (nil, nil, 0.9152, nil, nil, nil)
+     case .hunyuanVideo:
+@@ -3471,7 +3476,7 @@ public struct ModelZoo: DownloadZoo {
+     case .v1, .v2, .kandinsky21, .sdxlBase, .sdxlRefiner, .ssd1b, .svdI2v, .wurstchenStageC,
+       .wurstchenStageB, .sd3, .pixart, .auraflow, .flux1, .sd3Large, .hunyuanVideo, .wan21_1_3b,
+       .wan21_14b, .hiDreamI1, .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage,
+-      .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .minimaxH3Image, .mossImage, .cosmos2_5_2b,
++      .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .minimaxH3Image, .mossImage, .mingImage, .cosmos2_5_2b,
+       .cosmos2_5_2_9b, .ideogram4,
+       .krea2,
+       .ltx2, .ltx2_3,
+@@ -3488,7 +3493,7 @@ public struct ModelZoo: DownloadZoo {
+     case .v1, .v2, .svdI2v, .ssd1b, .sdxlBase, .sdxlRefiner, .pixart, .auraflow, .kandinsky21,
+       .wurstchenStageC, .wurstchenStageB, .sd3, .sd3Large, .flux1, .hiDreamI1, .hiDreamO1, .zImage,
+       .ernieImage, .hunyuanVideo, .wan21_1_3b, .wan21_14b, .qwenImage, .qwenImage2_1, .wan22_5b,
+-      .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .minimaxH3Image, .mossImage, .cosmos2_5_2b,
++      .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .minimaxH3Image, .mossImage, .mingImage, .cosmos2_5_2b,
+       .cosmos2_5_2_9b, .seedvr2_3b, .seedvr2_7b,
+       .ideogram4,
+       .krea2:
+@@ -3560,7 +3565,7 @@ public struct ModelZoo: DownloadZoo {
+       .sdxlBase, .sdxlRefiner, .ssd1b, .svdI2v, .wurstchenStageB, .wurstchenStageC, .zImage,
+       .ernieImage,
+       .flux2, .flux2_9b,
+-      .flux2_4b, .flux3_5b, .fibo2, .minimaxH3Image, .mossImage, .cosmos2_5_2b, .cosmos2_5_2_9b, .seedvr2_3b,
++      .flux2_4b, .flux3_5b, .fibo2, .minimaxH3Image, .mossImage, .mingImage, .cosmos2_5_2b, .cosmos2_5_2_9b, .seedvr2_3b,
+       .seedvr2_7b, .ideogram4, .krea2:
+       return 30
+     }
+@@ -3585,7 +3590,7 @@ public struct ModelZoo: DownloadZoo {
+       case .v1, .v2, .kandinsky21, .sdxlBase, .sdxlRefiner, .ssd1b, .svdI2v, .wurstchenStageC,
+         .wurstchenStageB, .sd3, .pixart, .auraflow, .sd3Large, .wan21_1_3b, .wan21_14b, .qwenImage,
+         .qwenImage2_1, .wan22_5b, .zImage, .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .minimaxH3Image,
+-        .mossImage,
++        .mossImage, .mingImage,
+         .cosmos2_5_2b, .cosmos2_5_2_9b,
+         .ltx2, .ltx2_3, .seedvr2_3b, .seedvr2_7b, .hiDreamO1, .ideogram4, .krea2,
+         .longcatVideoAvatar1_5:
+@@ -3688,7 +3693,7 @@ public struct ModelZoo: DownloadZoo {
+         return fileSize < 13 * 1_024 * 1_024 * 1_024 + 512 * 1_024 * 1_024
+       case .hiDreamO1:
+         return false
+-      case .zImage:
++      case .zImage, .mingImage:
+         return fileSize < 5 * 1_024 * 1_024 * 1_024
+       case .ernieImage:
+         return fileSize < 9 * 1_024 * 1_024 * 1_024
+@@ -3776,7 +3781,7 @@ public struct ModelZoo: DownloadZoo {
+         return fileSize < 17 * 1_024 * 1_024 * 1_024
+       case .hiDreamO1:
+         return false
+-      case .zImage:
++      case .zImage, .mingImage:
+         return fileSize < 8 * 1_024 * 1_024 * 1_024
+       case .ernieImage:
+         return fileSize < 9 * 1_024 * 1_024 * 1_024
+@@ -3947,7 +3952,7 @@ extension ModelZoo {
+   public static func isCLIPSkipAvailable(_ version: ModelVersion) -> Bool {
+     switch version {
+     case .pixart, .auraflow, .wan21_14b, .wan21_1_3b, .qwenImage, .qwenImage2_1, .svdI2v, .wan22_5b,
+-      .zImage, .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .cosmos2_5_2b,
++      .zImage, .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .mingImage, .cosmos2_5_2b,
+       .cosmos2_5_2_9b,
+       .ltx2, .ltx2_3,
+       .seedvr2_3b, .seedvr2_7b, .hiDreamO1, .ideogram4, .krea2, .longcatVideoAvatar1_5, .minimaxH3, .minimaxH3Image:
+diff --git a/Libraries/ModelZoo/Sources/TextualInversionZoo.swift b/Libraries/ModelZoo/Sources/TextualInversionZoo.swift
+index cff4c13..89e5eda 100644
+--- a/Libraries/ModelZoo/Sources/TextualInversionZoo.swift
++++ b/Libraries/ModelZoo/Sources/TextualInversionZoo.swift
+@@ -287,7 +287,7 @@ public struct TextualInversionZoo: DownloadZoo {
+     case .kandinsky21, .svdI2v, .wurstchenStageC, .wurstchenStageB, .hunyuanVideo, .wan21_1_3b,
+       .wan21_14b, .hiDreamI1, .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage,
+       .ernieImage, .ltx2, .ltx2_3, .seedvr2_3b, .seedvr2_7b, .ideogram4, .krea2,
+-      .longcatVideoAvatar1_5, .minimaxH3, .minimaxH3Image, .mossImage:
++      .longcatVideoAvatar1_5, .minimaxH3, .minimaxH3Image, .mossImage, .mingImage:
+       fatalError()
+     }
+     var tensor: Tensor<FloatType>? = nil
+@@ -323,7 +323,7 @@ public struct TextualInversionZoo: DownloadZoo {
+         tensorName = "string_to_param_qwen3"
+       case .kandinsky21, .svdI2v, .wurstchenStageC, .wurstchenStageB, .hunyuanVideo, .wan21_1_3b,
+         .wan21_14b, .hiDreamI1, .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage,
+-        .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .ltx2, .ltx2_3,
++        .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .mingImage, .ltx2, .ltx2_3,
+         .seedvr2_3b,
+         .seedvr2_7b,
+         .ideogram4, .krea2, .longcatVideoAvatar1_5, .minimaxH3, .minimaxH3Image:
+diff --git a/Libraries/SwiftDiffusion/Sources/ControlModel.swift b/Libraries/SwiftDiffusion/Sources/ControlModel.swift
+index 824943c..3acde9a 100644
+--- a/Libraries/SwiftDiffusion/Sources/ControlModel.swift
++++ b/Libraries/SwiftDiffusion/Sources/ControlModel.swift
+@@ -384,7 +384,7 @@ extension ControlModel {
+     switch version {
+     case .v1, .v2, .sdxlBase, .ssd1b, .sdxlRefiner, .svdI2v, .kandinsky21, .sd3, .pixart, .auraflow,
+       .flux1, .sd3Large, .hunyuanVideo, .wan21_1_3b, .wan21_14b, .hiDreamI1, .qwenImage,
+-      .qwenImage2_1, .zImage, .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage,
++      .qwenImage2_1, .zImage, .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .mingImage,
+       .cosmos2_5_2b, .cosmos2_5_2_9b,
+       .seedvr2_3b,
+       .seedvr2_7b, .ideogram4, .krea2, .longcatVideoAvatar1_5:
+@@ -608,7 +608,7 @@ extension ControlModel {
+         case .auraflow, .hiDreamI1, .hiDreamO1, .hunyuanVideo, .kandinsky21, .pixart, .sd3,
+           .sd3Large, .sdxlBase, .sdxlRefiner, .ssd1b, .svdI2v, .v1, .v2, .wurstchenStageB,
+           .wurstchenStageC, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage, .ernieImage, .flux2,
+-          .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .cosmos2_5_2b, .cosmos2_5_2_9b,
++          .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .mingImage, .cosmos2_5_2b, .cosmos2_5_2_9b,
+           .ltx2, .ltx2_3, .seedvr2_3b,
+           .seedvr2_7b,
+           .ideogram4,
+@@ -931,7 +931,7 @@ extension ControlModel {
+         case .v2, .sd3, .sd3Large, .pixart, .auraflow, .flux1, .sdxlRefiner, .kandinsky21, .ssd1b,
+           .svdI2v, .wurstchenStageC, .wurstchenStageB, .hunyuanVideo, .wan21_1_3b, .wan21_14b,
+           .hiDreamI1, .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage, .ernieImage,
+-          .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .cosmos2_5_2b,
++          .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .mingImage, .cosmos2_5_2b,
+           .cosmos2_5_2_9b, .ltx2, .ltx2_3,
+           .seedvr2_3b,
+           .seedvr2_7b,
+@@ -967,7 +967,7 @@ extension ControlModel {
+         case .v2, .sd3, .sd3Large, .pixart, .auraflow, .flux1, .sdxlRefiner, .kandinsky21, .ssd1b,
+           .svdI2v, .wurstchenStageC, .wurstchenStageB, .hunyuanVideo, .wan21_1_3b, .wan21_14b,
+           .hiDreamI1, .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage, .ernieImage,
+-          .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .cosmos2_5_2b,
++          .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .mingImage, .cosmos2_5_2b,
+           .cosmos2_5_2_9b, .ltx2, .ltx2_3,
+           .seedvr2_3b,
+           .seedvr2_7b,
+@@ -991,7 +991,7 @@ extension ControlModel {
+       case .v2, .sd3, .sd3Large, .pixart, .auraflow, .flux1, .sdxlRefiner, .kandinsky21, .ssd1b,
+         .svdI2v, .wurstchenStageC, .wurstchenStageB, .hunyuanVideo, .wan21_1_3b, .wan21_14b,
+         .hiDreamI1, .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage, .ernieImage, .flux2,
+-        .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .cosmos2_5_2b, .cosmos2_5_2_9b,
++        .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .mingImage, .cosmos2_5_2b, .cosmos2_5_2_9b,
+         .ltx2, .ltx2_3, .seedvr2_3b,
+         .seedvr2_7b,
+         .ideogram4,
+@@ -1047,7 +1047,7 @@ extension ControlModel {
+             case .v2, .sd3, .sd3Large, .pixart, .auraflow, .flux1, .sdxlRefiner, .kandinsky21,
+               .ssd1b, .svdI2v, .wurstchenStageC, .wurstchenStageB, .hunyuanVideo, .wan21_1_3b,
+               .wan21_14b, .hiDreamI1, .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage,
+-              .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage,
++              .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .mingImage,
+               .cosmos2_5_2b, .cosmos2_5_2_9b,
+               .ltx2, .ltx2_3,
+               .seedvr2_3b,
+@@ -1087,7 +1087,7 @@ extension ControlModel {
+       case .v2, .sd3, .sd3Large, .pixart, .auraflow, .flux1, .sdxlRefiner, .kandinsky21, .ssd1b,
+         .svdI2v, .wurstchenStageC, .wurstchenStageB, .hunyuanVideo, .wan21_1_3b, .wan21_14b,
+         .hiDreamI1, .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage, .ernieImage, .flux2,
+-        .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .cosmos2_5_2b, .cosmos2_5_2_9b,
++        .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .mingImage, .cosmos2_5_2b, .cosmos2_5_2_9b,
+         .ltx2, .ltx2_3, .seedvr2_3b,
+         .seedvr2_7b,
+         .ideogram4,
+@@ -1121,7 +1121,7 @@ extension ControlModel {
+         case .v2, .sd3, .sd3Large, .pixart, .auraflow, .flux1, .sdxlRefiner, .kandinsky21, .ssd1b,
+           .svdI2v, .wurstchenStageC, .wurstchenStageB, .hunyuanVideo, .wan21_1_3b, .wan21_14b,
+           .hiDreamI1, .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage, .ernieImage,
+-          .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .cosmos2_5_2b,
++          .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .mingImage, .cosmos2_5_2b,
+           .cosmos2_5_2_9b, .ltx2, .ltx2_3,
+           .seedvr2_3b,
+           .seedvr2_7b,
+@@ -1145,7 +1145,7 @@ extension ControlModel {
+       case .v2, .sd3, .sd3Large, .pixart, .auraflow, .flux1, .sdxlRefiner, .kandinsky21, .ssd1b,
+         .svdI2v, .wurstchenStageC, .wurstchenStageB, .hunyuanVideo, .wan21_1_3b, .wan21_14b,
+         .hiDreamI1, .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage, .ernieImage, .flux2,
+-        .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .cosmos2_5_2b, .cosmos2_5_2_9b,
++        .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .mingImage, .cosmos2_5_2b, .cosmos2_5_2_9b,
+         .ltx2, .ltx2_3, .seedvr2_3b,
+         .seedvr2_7b,
+         .ideogram4,
+@@ -1202,7 +1202,7 @@ extension ControlModel {
+             case .v2, .sd3, .sd3Large, .pixart, .auraflow, .flux1, .sdxlRefiner, .kandinsky21,
+               .ssd1b, .svdI2v, .wurstchenStageC, .wurstchenStageB, .hunyuanVideo, .wan21_1_3b,
+               .wan21_14b, .hiDreamI1, .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage,
+-              .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage,
++              .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .mingImage,
+               .cosmos2_5_2b, .cosmos2_5_2_9b,
+               .ltx2, .ltx2_3,
+               .seedvr2_3b,
+@@ -1327,7 +1327,7 @@ extension ControlModel {
+         case .v2, .sd3, .sd3Large, .pixart, .auraflow, .flux1, .sdxlRefiner, .kandinsky21, .ssd1b,
+           .svdI2v, .wurstchenStageC, .wurstchenStageB, .hunyuanVideo, .wan21_1_3b, .wan21_14b,
+           .hiDreamI1, .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage, .ernieImage,
+-          .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .cosmos2_5_2b,
++          .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .mingImage, .cosmos2_5_2b,
+           .cosmos2_5_2_9b, .ltx2, .ltx2_3,
+           .seedvr2_3b,
+           .seedvr2_7b,
+@@ -1351,7 +1351,7 @@ extension ControlModel {
+       case .v2, .sd3, .sd3Large, .pixart, .auraflow, .flux1, .sdxlRefiner, .kandinsky21, .ssd1b,
+         .svdI2v, .wurstchenStageC, .wurstchenStageB, .hunyuanVideo, .wan21_1_3b, .wan21_14b,
+         .hiDreamI1, .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage, .ernieImage, .flux2,
+-        .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .cosmos2_5_2b, .cosmos2_5_2_9b,
++        .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .mingImage, .cosmos2_5_2b, .cosmos2_5_2_9b,
+         .ltx2, .ltx2_3, .seedvr2_3b,
+         .seedvr2_7b,
+         .ideogram4,
+@@ -1411,7 +1411,7 @@ extension ControlModel {
+             case .v2, .sd3, .sd3Large, .pixart, .auraflow, .flux1, .sdxlRefiner, .kandinsky21,
+               .ssd1b, .svdI2v, .wurstchenStageC, .wurstchenStageB, .hunyuanVideo, .wan21_1_3b,
+               .wan21_14b, .hiDreamI1, .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage,
+-              .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage,
++              .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .mingImage,
+               .cosmos2_5_2b, .cosmos2_5_2_9b,
+               .ltx2, .ltx2_3,
+               .seedvr2_3b,
+@@ -1518,7 +1518,7 @@ extension ControlModel {
+         case .v1, .sdxlBase, .v2, .sd3, .sd3Large, .pixart, .auraflow, .sdxlRefiner, .kandinsky21,
+           .ssd1b, .svdI2v, .wurstchenStageC, .wurstchenStageB, .hunyuanVideo, .wan21_1_3b,
+           .wan21_14b, .hiDreamI1, .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage,
+-          .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .cosmos2_5_2b,
++          .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .mingImage, .cosmos2_5_2b,
+           .cosmos2_5_2_9b, .ltx2,
+           .ltx2_3,
+           .seedvr2_3b,
+@@ -1538,7 +1538,7 @@ extension ControlModel {
+       case .v1, .v2, .sdxlBase, .sd3, .sd3Large, .pixart, .auraflow, .sdxlRefiner, .kandinsky21,
+         .ssd1b, .svdI2v, .wurstchenStageC, .wurstchenStageB, .hunyuanVideo, .wan21_1_3b, .wan21_14b,
+         .hiDreamI1, .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage, .ernieImage, .flux2,
+-        .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .cosmos2_5_2b, .cosmos2_5_2_9b,
++        .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .mingImage, .cosmos2_5_2b, .cosmos2_5_2_9b,
+         .ltx2, .ltx2_3, .seedvr2_3b,
+         .seedvr2_7b,
+         .ideogram4,
+@@ -1841,7 +1841,7 @@ extension ControlModel {
+     case .sd3, .sd3Large, .pixart, .auraflow, .kandinsky21, .svdI2v, .sdxlRefiner, .ssd1b,
+       .wurstchenStageC, .wurstchenStageB, .hunyuanVideo, .hiDreamI1, .hiDreamO1, .qwenImage,
+       .qwenImage2_1, .wan22_5b, .zImage, .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2,
+-      .mossImage,
++      .mossImage, .mingImage,
+       .cosmos2_5_2b, .cosmos2_5_2_9b,
+       .ltx2, .ltx2_3, .seedvr2_3b, .seedvr2_7b, .ideogram4, .krea2, .minimaxH3, .minimaxH3Image:
+       fatalError()
+@@ -1991,7 +1991,7 @@ extension ControlModel {
+     case .v2, .sd3, .sd3Large, .pixart, .auraflow, .sdxlRefiner, .kandinsky21, .ssd1b, .svdI2v,
+       .wurstchenStageC, .wurstchenStageB, .hunyuanVideo, .wan21_1_3b, .wan21_14b, .hiDreamI1,
+       .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage, .ernieImage, .flux2, .flux2_9b,
+-      .flux2_4b, .flux3_5b, .fibo2, .mossImage, .cosmos2_5_2b, .cosmos2_5_2_9b, .ltx2, .ltx2_3,
++      .flux2_4b, .flux3_5b, .fibo2, .mossImage, .mingImage, .cosmos2_5_2b, .cosmos2_5_2_9b, .ltx2, .ltx2_3,
+       .seedvr2_3b, .seedvr2_7b,
+       .ideogram4,
+       .krea2,
+@@ -2392,7 +2392,7 @@ extension ControlModel {
+     case .auraflow, .kandinsky21, .pixart, .sd3, .sd3Large, .sdxlRefiner, .ssd1b, .svdI2v, .v1, .v2,
+       .wurstchenStageB, .wurstchenStageC, .hunyuanVideo, .wan21_1_3b, .wan21_14b, .hiDreamI1,
+       .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage, .ernieImage, .flux2, .flux2_9b,
+-      .flux2_4b, .flux3_5b, .fibo2, .mossImage, .cosmos2_5_2b, .cosmos2_5_2_9b, .ltx2, .ltx2_3,
++      .flux2_4b, .flux3_5b, .fibo2, .mossImage, .mingImage, .cosmos2_5_2b, .cosmos2_5_2_9b, .ltx2, .ltx2_3,
+       .seedvr2_3b, .seedvr2_7b,
+       .ideogram4,
+       .krea2,
+@@ -2549,7 +2549,7 @@ extension ControlModel {
+       case .sd3, .sd3Large, .pixart, .auraflow, .kandinsky21, .sdxlRefiner, .ssd1b, .svdI2v,
+         .wurstchenStageC, .wurstchenStageB, .hunyuanVideo, .wan21_1_3b, .wan21_14b, .hiDreamI1,
+         .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage, .ernieImage, .flux2, .flux2_9b,
+-        .flux2_4b, .flux3_5b, .fibo2, .mossImage, .cosmos2_5_2b, .cosmos2_5_2_9b, .ltx2, .ltx2_3,
++        .flux2_4b, .flux3_5b, .fibo2, .mossImage, .mingImage, .cosmos2_5_2b, .cosmos2_5_2_9b, .ltx2, .ltx2_3,
+         .seedvr2_3b, .seedvr2_7b,
+         .ideogram4,
+         .krea2,
+@@ -2636,7 +2636,7 @@ extension ControlModel {
+       case .sd3, .sd3Large, .pixart, .auraflow, .kandinsky21, .sdxlRefiner, .ssd1b, .svdI2v,
+         .wurstchenStageC, .wurstchenStageB, .hunyuanVideo, .hiDreamI1, .hiDreamO1, .qwenImage,
+         .qwenImage2_1, .wan22_5b, .zImage, .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2,
+-        .mossImage,
++        .mossImage, .mingImage,
+         .cosmos2_5_2b, .cosmos2_5_2_9b,
+         .ltx2, .ltx2_3, .seedvr2_3b, .seedvr2_7b, .ideogram4, .krea2, .minimaxH3, .minimaxH3Image:
+         fatalError()
+@@ -2784,7 +2784,7 @@ extension ControlModel {
+     case .auraflow, .kandinsky21, .pixart, .sd3, .sd3Large, .sdxlBase, .sdxlRefiner, .ssd1b,
+       .svdI2v, .v1, .v2, .wurstchenStageB, .wurstchenStageC, .hunyuanVideo, .wan21_1_3b, .wan21_14b,
+       .hiDreamI1, .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage, .ernieImage, .flux2,
+-      .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .cosmos2_5_2b, .cosmos2_5_2_9b, .ltx2,
++      .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .mingImage, .cosmos2_5_2b, .cosmos2_5_2_9b, .ltx2,
+       .ltx2_3, .seedvr2_3b,
+       .seedvr2_7b,
+       .ideogram4,
+diff --git a/Libraries/SwiftDiffusion/Sources/FirstStage.swift b/Libraries/SwiftDiffusion/Sources/FirstStage.swift
+index 0d475c2..867701d 100644
+--- a/Libraries/SwiftDiffusion/Sources/FirstStage.swift
++++ b/Libraries/SwiftDiffusion/Sources/FirstStage.swift
+@@ -194,7 +194,7 @@ extension FirstStage {
+           .reshaped(.HWC(1, audioFrames, shape[3])))
+     case .v1, .v2, .kandinsky21, .sdxlBase, .sdxlRefiner, .ssd1b, .svdI2v, .wurstchenStageC,
+       .wurstchenStageB, .sd3, .pixart, .auraflow, .flux1, .sd3Large, .hunyuanVideo, .wan21_1_3b,
+-      .wan21_14b, .hiDreamI1, .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage,
++      .wan21_14b, .hiDreamI1, .hiDreamO1, .qwenImage, .mingImage, .qwenImage2_1, .wan22_5b, .zImage,
+       .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .minimaxH3Image, .mossImage, .cosmos2_5_2b,
+       .cosmos2_5_2_9b, .ideogram4,
+       .krea2,
+@@ -274,7 +274,7 @@ extension FirstStage {
+     case .qwenImage2_1:
+       scaleFactor = 16
+       scaleFactorZ = 1
+-    case .hunyuanVideo, .wan21_1_3b, .wan21_14b, .qwenImage, .krea2, .cosmos2_5_2b,
++    case .hunyuanVideo, .wan21_1_3b, .wan21_14b, .qwenImage, .mingImage, .krea2, .cosmos2_5_2b,
+       .cosmos2_5_2_9b,
+       .seedvr2_3b, .seedvr2_7b, .longcatVideoAvatar1_5:
+       scaleFactor = 8
+@@ -684,7 +684,7 @@ extension FirstStage {
+       }
+       outputChannels = 4
+       causalAttentionMask = nil
+-    case .wan21_1_3b, .wan21_14b, .qwenImage, .krea2, .cosmos2_5_2b, .cosmos2_5_2_9b,
++    case .wan21_1_3b, .wan21_14b, .qwenImage, .mingImage, .krea2, .cosmos2_5_2b, .cosmos2_5_2_9b,
+       .longcatVideoAvatar1_5:
+       let startDepth =
+         version == .qwenImage || version == .krea2 || version == .cosmos2_5_2b
+@@ -1156,7 +1156,7 @@ extension FirstStage {
+           }
+         case .v1, .v2, .kandinsky21, .sdxlBase, .sdxlRefiner, .ssd1b, .svdI2v, .wurstchenStageC,
+           .wurstchenStageB, .sd3, .pixart, .auraflow, .flux1, .sd3Large, .hunyuanVideo, .wan21_1_3b,
+-          .wan21_14b, .hiDreamI1, .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage,
++          .wan21_14b, .hiDreamI1, .hiDreamO1, .qwenImage, .mingImage, .qwenImage2_1, .wan22_5b, .zImage,
+           .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .minimaxH3Image, .mossImage, .cosmos2_5_2b,
+           .cosmos2_5_2_9b,
+           .ideogram4, .krea2,
+@@ -1295,7 +1295,7 @@ extension FirstStage {
+         return (std .* result + mean).clamped(0...1) * 2 - 1
+       case .v1, .v2, .kandinsky21, .sdxlBase, .sdxlRefiner, .ssd1b, .svdI2v, .wurstchenStageC,
+         .wurstchenStageB, .sd3, .pixart, .auraflow, .flux1, .sd3Large, .hunyuanVideo, .wan21_1_3b,
+-        .wan21_14b, .hiDreamI1, .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage,
++        .wan21_14b, .hiDreamI1, .hiDreamO1, .qwenImage, .mingImage, .qwenImage2_1, .wan22_5b, .zImage,
+         .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .cosmos2_5_2b,
+         .cosmos2_5_2_9b, .ideogram4,
+         .krea2,
+@@ -1557,7 +1557,7 @@ extension FirstStage {
+     case .qwenImage2_1:
+       scaleFactor = 16
+       scaleFactorZ = 1
+-    case .hunyuanVideo, .wan21_1_3b, .wan21_14b, .qwenImage, .krea2, .cosmos2_5_2b,
++    case .hunyuanVideo, .wan21_1_3b, .wan21_14b, .qwenImage, .mingImage, .krea2, .cosmos2_5_2b,
+       .cosmos2_5_2_9b,
+       .seedvr2_3b, .seedvr2_7b, .longcatVideoAvatar1_5:
+       scaleFactor = 8
+@@ -1847,7 +1847,7 @@ extension FirstStage {
+       }
+       outputChannels = 128
+       causalAttentionMask = nil
+-    case .wan21_1_3b, .wan21_14b, .qwenImage, .krea2, .cosmos2_5_2b, .cosmos2_5_2_9b,
++    case .wan21_1_3b, .wan21_14b, .qwenImage, .mingImage, .krea2, .cosmos2_5_2b, .cosmos2_5_2_9b,
+       .longcatVideoAvatar1_5:
+       let startDepth =
+         version == .qwenImage || version == .krea2 || version == .cosmos2_5_2b
+diff --git a/Libraries/SwiftDiffusion/Sources/Models/MingText.swift b/Libraries/SwiftDiffusion/Sources/Models/MingText.swift
+new file mode 100644
+index 0000000..7812ada
+--- /dev/null
++++ b/Libraries/SwiftDiffusion/Sources/Models/MingText.swift
+@@ -0,0 +1,514 @@
++import Foundation
++import NNC
++
++// Ming-Image 0.1's text conditioning: the Ling (BailingMoeV2) language model, run over the chat
++// prompt followed by 256 learnable query tokens, a bidirectional Qwen2 connector over those 256
++// outputs, and the projections that turn both into the DiT's caption features.
++// Reference: https://github.com/inclusionAI/Ming-Image (modeling_bailing_moe_v2.py,
++// modeling_bailingmm2.py). The numbers a port must match are in DT Hub's
++// docs/superpowers/specs/2026-11-23-ming-image-design.md (section 6b).
++//
++// The language model runs one layer per graph. A MoE layer is two graphs, with the routing in
++// between on the host: BailingMoeV2 picks experts inside score groups (8 groups, best 4, then the
++// top 8), which MoERouting cannot do, so the host chooses the experts and MoERouting only weights
++// them (`preselected`).
++
++public struct MingLingConfiguration {
++  public var hiddenSize = 2_048
++  public var layers = 20
++  public var heads = 16
++  public var keyValueHeads = 4
++  public var headDimension = 128
++  /// Only the first half of each head is rotated (partial_rotary_factor 0.5).
++  public var rotaryDimension = 64
++  /// `mrope_section` [8, 12, 12] under video_rope: pairs 0..<24 alternate height and width, the
++  /// remaining 8 use time.
++  public var rotarySpatialPairs = 24
++  public var ropeTheta: Double = 600_000
++  public var denseLayers = 1
++  public var denseIntermediateSize = 5_120
++  public var experts = 256
++  public var expertsPerToken = 8
++  public var expertGroups = 8
++  public var selectedGroups = 4
++  public var expertIntermediateSize = 512
++  public var routedScalingFactor: Float = 2.5
++  public var vocabularySize = 157_184
++  public var normEpsilon: Float = 1e-6
++  public init() {}
++  public static let ming = MingLingConfiguration()
++}
++
++/// The Qwen2 connector (bidirectional) and the projections around it.
++public struct MingConnectorConfiguration {
++  public var inputSize = 2_048
++  public var hiddenSize = 1_536
++  public var layers = 28
++  public var heads = 12
++  public var keyValueHeads = 2
++  public var headDimension = 128
++  public var intermediateSize = 8_960
++  public var outputSize = 2_560
++  public var ropeTheta: Double = 1_000_000
++  public var normEpsilon: Float = 1e-6
++  public init() {}
++  public static let ming = MingConnectorConfiguration()
++}
++
++/// Rotary table for the language model: `[1, length, 1, headDimension]` as (cos, sin) pairs. The
++/// first `rotaryDimension / 2` pairs rotate with the height, width or time position of the token
++/// (`positions` is `[3][length]` in the order time, height, width); the rest are identity.
++public func MingLingRotaryEmbedding<FloatType: TensorNumeric & BinaryFloatingPoint>(
++  positions: [[Int]], configuration: MingLingConfiguration = .ming,
++  of dataType: FloatType.Type = FloatType.self
++) -> Tensor<FloatType> {
++  precondition(positions.count == 3)
++  let length = positions[0].count
++  let pairs = configuration.headDimension / 2
++  let rotatedPairs = configuration.rotaryDimension / 2
++  var rotary = Tensor<FloatType>(.CPU, .NHWC(1, length, 1, configuration.headDimension))
++  for i in 0..<length {
++    for k in 0..<pairs {
++      guard k < rotatedPairs else {
++        rotary[0, i, 0, k * 2] = 1
++        rotary[0, i, 0, k * 2 + 1] = 0
++        continue
++      }
++      // Time is row 0, height row 1, width row 2.
++      let row = k < configuration.rotarySpatialPairs ? (k % 2 == 0 ? 1 : 2) : 0
++      let frequency = 1.0 / pow(configuration.ropeTheta, Double(k * 2) / Double(rotatedPairs * 2))
++      let angle = Double(positions[row][i]) * frequency
++      rotary[0, i, 0, k * 2] = FloatType(cos(angle))
++      rotary[0, i, 0, k * 2 + 1] = FloatType(sin(angle))
++    }
++  }
++  return rotary
++}
++
++/// Rotary table of the connector: ordinary rotary over the whole head.
++public func MingConnectorRotaryEmbedding<FloatType: TensorNumeric & BinaryFloatingPoint>(
++  length: Int, configuration: MingConnectorConfiguration = .ming,
++  of dataType: FloatType.Type = FloatType.self
++) -> Tensor<FloatType> {
++  var rotary = Tensor<FloatType>(.CPU, .NHWC(1, length, 1, configuration.headDimension))
++  for i in 0..<length {
++    for k in 0..<(configuration.headDimension / 2) {
++      let theta =
++        Double(i) / pow(configuration.ropeTheta, Double(k * 2) / Double(configuration.headDimension))
++      rotary[0, i, 0, k * 2] = FloatType(cos(theta))
++      rotary[0, i, 0, k * 2 + 1] = FloatType(sin(theta))
++    }
++  }
++  return rotary
++}
++
++// MARK: - Attention (shared by the language model and the connector)
++
++private struct MingAttentionParts {
++  var toQueries: Model
++  var toKeys: Model
++  var toValues: Model
++  var out: Model
++  var normQ: Model?
++  var normK: Model?
++}
++
++private func MingAttention(
++  prefix: String, width: Int, headDimension k: Int, heads h: Int, keyValueHeads hk: Int,
++  tokenLength t: Int, hasBias: Bool, hasQKNorm: Bool, normEpsilon: Float, isCausal: Bool,
++  usesFlashAttention: Bool, hasMask: Bool
++) -> (parts: MingAttentionParts, model: Model) {
++  let x = Input()
++  let rot = Input()
++  let mask: Input? = hasMask ? Input() : nil
++  let toKeys = Dense(count: k * hk, noBias: !hasBias, name: "\(prefix).k_proj")
++  let toQueries = Dense(count: k * h, noBias: !hasBias, name: "\(prefix).q_proj")
++  let toValues = Dense(count: k * hk, noBias: !hasBias, name: "\(prefix).v_proj")
++  var keys = toKeys(x).reshaped([1, t, hk, k], format: .NHWC)
++  var queries = toQueries(x).reshaped([1, t, h, k], format: .NHWC)
++  var normQ: Model? = nil
++  var normK: Model? = nil
++  if hasQKNorm {
++    let nk = RMSNorm(epsilon: normEpsilon, axis: [3], name: "\(prefix).k_norm")
++    let nq = RMSNorm(epsilon: normEpsilon, axis: [3], name: "\(prefix).q_norm")
++    keys = nk(keys)
++    queries = nq(queries)
++    normK = nk
++    normQ = nq
++  }
++  var values = toValues(x).reshaped([1, t, hk, k], format: .NHWC)
++  // Half of the scale on each side, as Qwen3 does, so the attention scale is 1.
++  queries = (1.0 / Float(k).squareRoot().squareRoot()) * Functional.cmul(left: queries, right: rot)
++  keys = (1.0 / Float(k).squareRoot().squareRoot()) * Functional.cmul(left: keys, right: rot)
++  var out: Model.IO
++  if usesFlashAttention {
++    let attention = ScaledDotProductAttention(
++      scale: 1, isCausal: isCausal, hasAttentionMask: hasMask)
++    if let mask {
++      out = attention(queries, keys, values, mask).reshaped([t, h * k])
++    } else {
++      out = attention(queries, keys, values).reshaped([t, h * k])
++    }
++  } else {
++    values = values.transposed(1, 2)
++    queries = queries.transposed(1, 2)
++    keys = keys.transposed(1, 2)
++    var outs = [Model.IO]()
++    for i in 0..<hk {
++      let query = queries.reshaped(
++        [1, h / hk, t, k], offset: [0, i * (h / hk), 0, 0], strides: [h * t * k, t * k, k, 1]
++      ).contiguous()
++      let key = keys.reshaped(
++        [1, 1, t, k], offset: [0, i, 0, 0], strides: [hk * t * k, t * k, k, 1]
++      ).contiguous()
++      let value = values.reshaped(
++        [1, 1, t, k], offset: [0, i, 0, 0], strides: [hk * t * k, t * k, k, 1]
++      ).contiguous()
++      var dot = Matmul(transposeB: (2, 3))(query, key)
++      if let last = outs.last {
++        dot.add(dependencies: [last])
++      }
++      if let mask {
++        dot = dot + mask
++      }
++      dot = dot.reshaped([(h / hk) * t, t])
++      dot = dot.softmax()
++      dot = dot.reshaped([1, h / hk, t, t])
++      outs.append(dot * value)
++    }
++    out = Concat(axis: 1)(outs).reshaped([1, h, t, k]).transposed(1, 2).reshaped([t, h * k])
++  }
++  let unifyheads = Dense(count: width, noBias: true, name: "\(prefix).out_proj")
++  out = unifyheads(out)
++  let inputs: [Model.IO] = mask.map { [x, rot, $0] } ?? [x, rot]
++  return (
++    MingAttentionParts(
++      toQueries: toQueries, toKeys: toKeys, toValues: toValues, out: unifyheads, normQ: normQ,
++      normK: normK),
++    Model(inputs, [out])
++  )
++}
++
++// MARK: - Language model
++
++/// Token embedding with the learnable queries injected: `x = embedding(tokens) * keep + injected`.
++public func MingLingEmbedding<T: TensorNumeric & BinaryFloatingPoint>(
++  _ dataType: T.Type, tokenLength: Int, configuration: MingLingConfiguration = .ming
++) -> (ModelWeightMapper, Model) {
++  let tokens = Input()
++  let keep = Input()
++  let injected = Input()
++  let embedding = Embedding(
++    T.self, vocabularySize: configuration.vocabularySize, embeddingSize: configuration.hiddenSize,
++    name: "tok_embeddings")
++  let out = embedding(tokens).to(.Float32) .* keep.to(.Float32) + injected.to(.Float32)
++  let mapper: ModelWeightMapper = { _ in
++    var mapping = ModelWeightMapping()
++    mapping["thinker.embed_tokens.weight"] = [embedding.weight.name]
++    return mapping
++  }
++  return (mapper, Model([tokens, keep, injected], [out]))
++}
++
++/// What the host needs from a layer's attention half.
++public struct MingLingAttentionOutputs {
++  /// Residual stream after attention, FP32 `[T, hidden]`.
++  public static let residual = 0
++  /// The post-attention RMSNorm output, FP32 `[T, hidden]`.
++  public static let normalized = 1
++  /// MoE layers only: router logits of the text gate and of the image gate, FP32 `[T, experts]`.
++  public static let textLogits = 2
++  public static let imageLogits = 3
++}
++
++/// Attention half of layer `layer`. Inputs: residual FP32 `[T, hidden]`, rotary table, causal mask
++/// `[1, 1, T, T]`. Outputs: see `MingLingAttentionOutputs`.
++public func MingLingAttentionHalf<T: TensorNumeric & BinaryFloatingPoint>(
++  _ dataType: T.Type, layer: Int, tokenLength: Int, usesFlashAttention: Bool,
++  configuration: MingLingConfiguration = .ming
++) -> (ModelWeightMapper, Model) {
++  let prefix = "layers.\(layer)"
++  let x = Input()
++  let norm1 = RMSNorm(epsilon: configuration.normEpsilon, axis: [1], name: "\(prefix).input_norm")
++  let (parts, attention) = MingAttention(
++    prefix: "\(prefix).attention", width: configuration.hiddenSize,
++    headDimension: configuration.headDimension, heads: configuration.heads,
++    keyValueHeads: configuration.keyValueHeads, tokenLength: tokenLength, hasBias: false,
++    hasQKNorm: true, normEpsilon: configuration.normEpsilon, isCausal: true,
++    usesFlashAttention: usesFlashAttention, hasMask: true)
++  let rot = Input()
++  let mask = Input()
++  var out = norm1(x).to(T.dataType)
++  out = attention(out, rot, mask).to(of: x) + x
++  let norm2 = RMSNorm(
++    epsilon: configuration.normEpsilon, axis: [1], name: "\(prefix).post_attention_norm")
++  let normalized = norm2(out)
++  var outputs: [Model.IO] = [out, normalized]
++  var textGate: Model? = nil
++  var imageGate: Model? = nil
++  if layer >= configuration.denseLayers {
++    let tg = Dense(count: configuration.experts, noBias: true, name: "\(prefix).text_gate")
++    let ig = Dense(count: configuration.experts, noBias: true, name: "\(prefix).image_gate")
++    outputs.append(tg(normalized))
++    outputs.append(ig(normalized))
++    textGate = tg
++    imageGate = ig
++  }
++  let mapper: ModelWeightMapper = { _ in
++    var mapping = ModelWeightMapping()
++    let P = "thinker.layers.\(layer)."
++    mapping[P + "input_layernorm.weight"] = [norm1.weight.name]
++    mapping[P + "post_attention_layernorm.weight"] = [norm2.weight.name]
++    // The checkpoint stores q, k and v as one matrix: the converter slices it into the three
++    // keys below. Hugging Face rotates the two halves of the rotary part, the engine rotates
++    // adjacent pairs, so the rotary rows of q, k and their norms are interleaved per head.
++    func rotated(_ name: String, heads: Int) -> ModelWeightElement {
++      ModelWeightElement(
++        [name], interleavedIndices: [0], numberOfHeads: heads,
++        headDimension: configuration.headDimension,
++        interleavedDimension: configuration.rotaryDimension)
++    }
++    mapping[P + "attention.query_key_value.weight#q"] = rotated(
++      parts.toQueries.weight.name, heads: configuration.heads)
++    mapping[P + "attention.query_key_value.weight#k"] = rotated(
++      parts.toKeys.weight.name, heads: configuration.keyValueHeads)
++    mapping[P + "attention.query_key_value.weight#v"] = [parts.toValues.weight.name]
++    mapping[P + "attention.dense.weight"] = [parts.out.weight.name]
++    mapping[P + "attention.q_norm.weight"] = rotated(parts.normQ!.weight.name, heads: 1)
++    mapping[P + "attention.k_norm.weight"] = rotated(parts.normK!.weight.name, heads: 1)
++    if let textGate, let imageGate {
++      mapping[P + "mlp.gate.proj.weight"] = [textGate.weight.name]
++      mapping[P + "mlp.image_gate.proj.weight"] = [imageGate.weight.name]
++    }
++    return mapping
++  }
++  return (mapper, Model([x, rot, mask], outputs))
++}
++
++/// Dense feed-forward of layer 0. Inputs: residual FP32, normalized FP32. Output: residual FP32.
++public func MingLingDenseHalf<T: TensorNumeric & BinaryFloatingPoint>(
++  _ dataType: T.Type, layer: Int, configuration: MingLingConfiguration = .ming
++) -> (ModelWeightMapper, Model) {
++  let prefix = "layers.\(layer)"
++  let residual = Input()
++  let normalized = Input()
++  let gate = Dense(
++    count: configuration.denseIntermediateSize, noBias: true, name: "\(prefix).mlp.gate_proj")
++  let up = Dense(
++    count: configuration.denseIntermediateSize, noBias: true, name: "\(prefix).mlp.up_proj")
++  let down = Dense(count: configuration.hiddenSize, noBias: true, name: "\(prefix).mlp.down_proj")
++  let input = normalized.to(T.dataType)
++  let out = residual + down(up(input) .* gate(input).swish()).to(of: residual)
++  let mapper: ModelWeightMapper = { _ in
++    var mapping = ModelWeightMapping()
++    let P = "thinker.layers.\(layer).mlp."
++    mapping[P + "gate_proj.weight"] = [gate.weight.name]
++    mapping[P + "up_proj.weight"] = [up.weight.name]
++    mapping[P + "down_proj.weight"] = [down.weight.name]
++    return mapping
++  }
++  return (mapper, Model([residual, normalized], [out]))
++}
++
++/// MoE half of a layer. Inputs: residual FP32 `[T, hidden]`, normalized FP32 `[T, hidden]`, the
++/// logits of the gate each token uses FP32 `[T, experts]`, and the experts the host picked,
++/// Int32 `[T, expertsPerToken]`. Output: residual FP32.
++public func MingLingMoEHalf(
++  layer: Int, tokenLength: Int, configuration: MingLingConfiguration = .ming
++) -> (ModelWeightMapper, Model) {
++  let prefix = "layers.\(layer)"
++  let residual = Input()
++  let normalized = Input()
++  let logits = Input()
++  let selected = Input()
++  let pairs = tokenLength * configuration.expertsPerToken
++  let prepared = MoERouting(
++    kth: configuration.expertsPerToken, weightScale: configuration.routedScalingFactor,
++    normalizationEpsilon: 1e-20, preselected: true, singleInputToken: false, sigmoid: true,
++    name: "\(prefix).routing")(logits, selected, normalized)
++  let experts = SegmentedSwiGLU(
++    segments: configuration.experts, count: configuration.expertIntermediateSize,
++    name: "\(prefix).experts")
++  let hidden = experts(prepared[0], prepared[3], prepared[4], prepared[1].reshaped([pairs, 1]))
++  let down = SegmentedDense(
++    segments: configuration.experts, count: configuration.hiddenSize, noBias: true,
++    name: "\(prefix).experts.down_proj")
++  let routed = Functional.scatterAdd(
++    count: tokenLength, countPerOutput: configuration.expertsPerToken,
++    down(hidden, prepared[3], prepared[4]), index: prepared[2]
++  ).reshaped([tokenLength, configuration.hiddenSize])
++  let shared = SwiGLU(count: configuration.expertIntermediateSize, name: "\(prefix).shared")
++  let sharedDown = Dense(
++    count: configuration.hiddenSize, noBias: true, name: "\(prefix).shared.down_proj")
++  let out = residual + routed + sharedDown(shared(normalized))
++  let mapper: ModelWeightMapper = { _ in
++    var mapping = ModelWeightMapping()
++    let P = "thinker.layers.\(layer).mlp."
++    // The checkpoint stacks the experts: gate_up_proj [experts, 2 * intermediate, hidden] is
++    // [gate; up], down_proj [experts, hidden, intermediate]. The converter writes the stacks.
++    mapping[P + "experts.gate_up_proj.weight#gate"] = [experts.parameters(for: .index(0)).name]
++    mapping[P + "experts.gate_up_proj.weight#up"] = [experts.parameters(for: .index(1)).name]
++    mapping[P + "experts.down_proj.weight"] = [down.weight.name]
++    mapping[P + "shared_experts.gate_proj.weight"] = [shared.parameters(for: .index(0)).name]
++    mapping[P + "shared_experts.up_proj.weight"] = [shared.parameters(for: .index(1)).name]
++    mapping[P + "shared_experts.down_proj.weight"] = [sharedDown.weight.name]
++    return mapping
++  }
++  return (mapper, Model([residual, normalized, logits, selected], [out]))
++}
++
++/// Final RMSNorm of the language model. Input: residual FP32. Output: normalized, FP32.
++public func MingLingFinalNorm(configuration: MingLingConfiguration = .ming) -> (
++  ModelWeightMapper, Model
++) {
++  let x = Input()
++  let norm = RMSNorm(epsilon: configuration.normEpsilon, axis: [1], name: "norm")
++  let mapper: ModelWeightMapper = { _ in
++    var mapping = ModelWeightMapping()
++    mapping["thinker.norm.weight"] = [norm.weight.name]
++    return mapping
++  }
++  return (mapper, Model([x], [norm(x)]))
++}
++
++/// Chooses the experts BailingMoeV2 picks: the 4 best groups of 32 by the sum of their two best
++/// scores (`sigmoid(logit) + bias`), then the 8 best experts in those groups. Returns, per token,
++/// the expert ids.
++public func MingLingSelectExperts(
++  scoresWithBias: [Float], tokenLength: Int, configuration: MingLingConfiguration = .ming
++) -> [Int32] {
++  let experts = configuration.experts
++  let groupSize = experts / configuration.expertGroups
++  var result = [Int32]()
++  result.reserveCapacity(tokenLength * configuration.expertsPerToken)
++  for token in 0..<tokenLength {
++    let row = Array(scoresWithBias[(token * experts)..<((token + 1) * experts)])
++    var groupScores = [(score: Float, group: Int)]()
++    for group in 0..<configuration.expertGroups {
++      let slice = row[(group * groupSize)..<((group + 1) * groupSize)].sorted(by: >)
++      groupScores.append((slice[0] + slice[1], group))
++    }
++    let chosen = Set(
++      groupScores.sorted { $0.score > $1.score }.prefix(configuration.selectedGroups).map(\.group))
++    var candidates = [(score: Float, expert: Int)]()
++    for group in chosen {
++      for e in (group * groupSize)..<((group + 1) * groupSize) {
++        candidates.append((row[e], e))
++      }
++    }
++    candidates.sort { $0.score > $1.score }
++    for c in candidates.prefix(configuration.expertsPerToken) {
++      result.append(Int32(c.expert))
++    }
++  }
++  return result
++}
++
++// MARK: - Connector and projections
++
++/// `proj_in` (2048 → 1536), the Qwen2 connector with attention in both directions, its final norm
++/// and `proj_out` (1536 → 2560), over the language model's 256 query outputs. Inputs: queries
++/// `[256, 2048]`, rotary table `[1, 256, 1, 128]`. Output: `[256, 2560]`.
++public func MingConnector<T: TensorNumeric & BinaryFloatingPoint>(
++  _ dataType: T.Type, tokenLength: Int, usesFlashAttention: Bool,
++  configuration c: MingConnectorConfiguration = .ming
++) -> (ModelWeightMapper, Model) {
++  let x = Input()
++  let rot = Input()
++  let projIn = Dense(count: c.hiddenSize, name: "proj_in")
++  var out = projIn(x).to(.Float32)
++  var mappers = [ModelWeightMapper]()
++  for i in 0..<c.layers {
++    let prefix = "connector.layers.\(i)"
++    let norm1 = RMSNorm(epsilon: c.normEpsilon, axis: [1], name: "\(prefix).input_norm")
++    let (parts, attention) = MingAttention(
++      prefix: "\(prefix).self_attn", width: c.hiddenSize, headDimension: c.headDimension,
++      heads: c.heads, keyValueHeads: c.keyValueHeads, tokenLength: tokenLength, hasBias: true,
++      hasQKNorm: false, normEpsilon: c.normEpsilon, isCausal: false,
++      usesFlashAttention: usesFlashAttention, hasMask: false)
++    let residual = out
++    out = attention(norm1(out).to(T.dataType), rot).to(of: residual) + residual
++    let norm2 = RMSNorm(epsilon: c.normEpsilon, axis: [1], name: "\(prefix).post_attention_norm")
++    let gate = Dense(count: c.intermediateSize, noBias: true, name: "\(prefix).mlp.gate_proj")
++    let up = Dense(count: c.intermediateSize, noBias: true, name: "\(prefix).mlp.up_proj")
++    let down = Dense(count: c.hiddenSize, noBias: true, name: "\(prefix).mlp.down_proj")
++    let input = norm2(out).to(T.dataType)
++    out = out + down(up(input) .* gate(input).swish()).to(of: out)
++    mappers.append { _ in
++      var mapping = ModelWeightMapping()
++      let P = "\(prefix)."
++      func rotated(_ name: String, heads: Int) -> ModelWeightElement {
++        ModelWeightElement(
++          [name], interleavedIndices: [0], numberOfHeads: heads, headDimension: c.headDimension)
++      }
++      mapping[P + "input_layernorm.weight"] = [norm1.weight.name]
++      mapping[P + "post_attention_layernorm.weight"] = [norm2.weight.name]
++      mapping[P + "self_attn.q_proj.weight"] = rotated(parts.toQueries.weight.name, heads: c.heads)
++      mapping[P + "self_attn.q_proj.bias"] = rotated(
++        parts.toQueries.bias.name, heads: c.heads)
++      mapping[P + "self_attn.k_proj.weight"] = rotated(
++        parts.toKeys.weight.name, heads: c.keyValueHeads)
++      mapping[P + "self_attn.k_proj.bias"] = rotated(parts.toKeys.bias.name, heads: c.keyValueHeads)
++      mapping[P + "self_attn.v_proj.weight"] = [parts.toValues.weight.name]
++      mapping[P + "self_attn.v_proj.bias"] = [parts.toValues.bias.name]
++      mapping[P + "self_attn.o_proj.weight"] = [parts.out.weight.name]
++      mapping[P + "mlp.gate_proj.weight"] = [gate.weight.name]
++      mapping[P + "mlp.up_proj.weight"] = [up.weight.name]
++      mapping[P + "mlp.down_proj.weight"] = [down.weight.name]
++      return mapping
++    }
++  }
++  let finalNorm = RMSNorm(epsilon: c.normEpsilon, axis: [1], name: "connector.norm")
++  let projOut = Dense(count: c.outputSize, name: "proj_out")
++  let result = projOut(finalNorm(out).to(T.dataType))
++  let mapper: ModelWeightMapper = { format in
++    var mapping = ModelWeightMapping()
++    mapping["proj_in.weight"] = [projIn.weight.name]
++    mapping["proj_in.bias"] = [projIn.bias.name]
++    mapping["connector.norm.weight"] = [finalNorm.weight.name]
++    mapping["proj_out.weight"] = [projOut.weight.name]
++    mapping["proj_out.bias"] = [projOut.bias.name]
++    for layerMapper in mappers {
++      mapping.merge(layerMapper(format)) { first, _ in first }
++    }
++    return mapping
++  }
++  return (mapper, Model([x, rot], [result]))
++}
++
++/// The second caption stream: the language model's hidden states after layers 5, 12 and 20 over
++/// the prompt tokens, concatenated (3 × 2048), RMS-normalized (1e-5) and projected to 3840.
++public func MingDirectVLMProjection<T: TensorNumeric & BinaryFloatingPoint>(
++  _ dataType: T.Type
++) -> (ModelWeightMapper, Model) {
++  let x = Input()
++  let norm = RMSNorm(epsilon: 1e-5, axis: [1], name: "proj_directvlm.norm")
++  let linear = Dense(count: 3_840, name: "proj_directvlm.linear")
++  let out = linear(norm(x).to(T.dataType))
++  let mapper: ModelWeightMapper = { _ in
++    var mapping = ModelWeightMapping()
++    mapping["proj_directvlm.0.weight"] = [norm.weight.name]
++    mapping["proj_directvlm.1.weight"] = [linear.weight.name]
++    mapping["proj_directvlm.1.bias"] = [linear.bias.name]
++    return mapping
++  }
++  return (mapper, Model([x], [out]))
++}
++
++// MARK: - VAE
++
++/// Ming-Image's VAE is the Wan 2.1 / Qwen-Image VAE (`AutoencoderKLQwenImage`: 96 base channels,
++/// multipliers [1, 2, 4, 4], two residual blocks, 16 latent channels, scaling factor 8.0064, no
++/// shift) with four colour channels, RGBA, on both ends.
++public func MingVAEDecoder(width: Int, height: Int) -> (ModelWeightMapper, Model) {
++  WanDecoderCausal3D(
++    channels: [96, 192, 384, 384], numRepeat: 2, startWidth: width, startHeight: height,
++    startDepth: 1, paddingFinalConvLayer: true, wan22: false, outputChannels: 4,
++    highPrecisionFinalNorm: true, usesFlashAttention: false, format: .NHWC)
++}
++
++public func MingVAEEncoder(width: Int, height: Int) -> (ModelWeightMapper, Model) {
++  WanEncoderCausal3D(
++    channels: [96, 192, 384, 384], numRepeat: 2, startWidth: width, startHeight: height,
++    startDepth: 1, wan22: false, inputChannels: 4, usesFlashAttention: false, format: .NHWC)
++}
+diff --git a/Libraries/SwiftDiffusion/Sources/Models/UNetProtocol.swift b/Libraries/SwiftDiffusion/Sources/Models/UNetProtocol.swift
+index 9cac314..d6cc7d6 100644
+--- a/Libraries/SwiftDiffusion/Sources/Models/UNetProtocol.swift
++++ b/Libraries/SwiftDiffusion/Sources/Models/UNetProtocol.swift
+@@ -131,7 +131,7 @@ extension UNetProtocol {
+         )
+         .toGPU(0))
+     case .sd3, .pixart, .auraflow, .flux1, .sd3Large, .hunyuanVideo, .wan21_1_3b, .wan21_14b,
+-      .hiDreamI1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage, .ernieImage, .flux2, .flux2_9b,
++      .hiDreamI1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage, .mingImage, .ernieImage, .flux2, .flux2_9b,
+       .flux2_4b, .flux3_5b, .fibo2, .mossImage, .cosmos2_5_2b, .cosmos2_5_2_9b, .ideogram4, .krea2,
+       .ltx2, .ltx2_3,
+       .longcatVideoAvatar1_5,
+@@ -369,7 +369,7 @@ public func UNetExtractConditions<FloatType: TensorNumeric & BinaryFloatingPoint
+           index..<(index + 1), 0..<shape[1], 0..<shape[2]
+         ].copied()
+       }
+-  case .zImage:
++  case .zImage, .mingImage:
+     let count = conditions.count
+     return conditions[0..<(count - 129)]
+       + conditions[(count - 129)..<conditions.count].map {
+@@ -683,7 +683,7 @@ public func externalOnDemandPartially(
+     switch version {
+     case .v1, .v2, .kandinsky21, .sdxlBase, .sdxlRefiner, .ssd1b, .svdI2v, .wurstchenStageC,
+       .wurstchenStageB, .sd3, .pixart, .auraflow, .wan21_1_3b, .wan22_5b, .flux1, .sd3Large,
+-      .hunyuanVideo, .hiDreamI1, .hiDreamO1, .wan21_14b, .qwenImage, .qwenImage2_1, .zImage,
++      .hunyuanVideo, .hiDreamI1, .hiDreamO1, .wan21_14b, .qwenImage, .qwenImage2_1, .zImage, .mingImage,
+       .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .cosmos2_5_2b,
+       .cosmos2_5_2_9b, .ltx2,
+       .ltx2_3,
+@@ -699,7 +699,7 @@ public func externalOnDemandPartially(
+       .wurstchenStageB, .sd3, .pixart, .auraflow, .wan21_1_3b, .wan22_5b:
+       return false
+     case .flux1, .sd3Large, .hunyuanVideo, .hiDreamI1, .hiDreamO1, .wan21_14b, .qwenImage,
+-      .qwenImage2_1, .zImage, .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage,
++      .qwenImage2_1, .zImage, .mingImage, .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage,
+       .cosmos2_5_2b, .cosmos2_5_2_9b,
+       .ltx2,
+       .ltx2_3, .seedvr2_3b, .seedvr2_7b, .ideogram4, .krea2, .longcatVideoAvatar1_5, .minimaxH3, .minimaxH3Image:
+@@ -1839,7 +1839,7 @@ extension UNetFromNNC {
+             ).1
+           })
+       }
+-    case .zImage:
++    case .zImage, .mingImage:
+       tiledWidth =
+         tiledDiffusion.isEnabled ? min(tiledDiffusion.tileSize.width * 8, startWidth) : startWidth
+       tiledHeight =
+@@ -2413,7 +2413,7 @@ extension UNetFromNNC {
+         c.append(contentsOf: injectedIPAdapters)
+       case .v2, .sd3, .sd3Large, .pixart, .auraflow, .kandinsky21, .svdI2v, .wurstchenStageC,
+         .wurstchenStageB, .hunyuanVideo, .wan21_1_3b, .wan21_14b, .hiDreamI1, .hiDreamO1,
+-        .qwenImage, .qwenImage2_1, .wan22_5b, .zImage, .ernieImage, .flux2, .flux2_9b, .flux2_4b,
++        .qwenImage, .qwenImage2_1, .wan22_5b, .zImage, .mingImage, .ernieImage, .flux2, .flux2_9b, .flux2_4b,
+         .flux3_5b, .fibo2, .mossImage,
+         .cosmos2_5_2b, .cosmos2_5_2_9b, .ltx2, .ltx2_3, .seedvr2_3b, .seedvr2_7b,
+         .ideogram4, .krea2,
+@@ -2481,7 +2481,7 @@ extension UNetFromNNC {
+     case .wurstchenStageC:
+       modelKey = "stage_c"
+     case .sd3, .pixart, .auraflow, .flux1, .sd3Large, .hunyuanVideo, .wan21_1_3b, .wan21_14b,
+-      .hiDreamI1, .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage, .ernieImage, .flux2,
++      .hiDreamI1, .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage, .mingImage, .ernieImage, .flux2,
+       .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .cosmos2_5_2b, .cosmos2_5_2_9b,
+       .ideogram4, .krea2, .ltx2,
+       .ltx2_3,
+@@ -2630,7 +2630,7 @@ extension UNetFromNNC {
+                 uniqueKeysWithValues: (0..<60).map {
+                   return ($0, $0)
+                 })
+-            case .zImage:
++            case .zImage, .mingImage:
+               return [Int: Int](
+                 uniqueKeysWithValues: (0..<30).map {
+                   return ($0, $0)
+@@ -3258,7 +3258,7 @@ extension UNetFromNNC {
+             tokenEncoding
+           return finalEncoding
+         }
+-      case .zImage:
++      case .zImage, .mingImage:
+         if $0.0 == count - 131 || $0.0 == count - 132 {
+           let shape = $0.1.shape
+           let tokenLength = shape[1] - (originalShape[1] / 2) * (originalShape[2] / 2)
+@@ -3782,7 +3782,7 @@ extension UNetFromNNC {
+       unet.compile(inputs: inputs)
+       // TODO: TeaCache insert here.
+       return
+-    case .zImage:
++    case .zImage, .mingImage:
+       guard isCfgEnabled else {
+         var inputs = inputs
+         inputs.remove(at: inputs.count - 131)
+@@ -4945,7 +4945,7 @@ extension UNetFromNNC {
+         }
+         return et
+       }
+-    case .zImage:
++    case .zImage, .mingImage:
+       guard isCfgEnabled else {
+         var restInputs = restInputs
+         restInputs.remove(at: restInputs.count - 131)
+@@ -5834,7 +5834,7 @@ extension UNetFromNNC {
+       return ((rows * 32 + 23) / 24, height)
+     case .v1, .v2, .kandinsky21, .sdxlBase, .sdxlRefiner, .ssd1b, .svdI2v, .wurstchenStageC,
+       .wurstchenStageB, .sd3, .pixart, .auraflow, .flux1, .sd3Large, .hunyuanVideo, .wan21_1_3b,
+-      .wan21_14b, .hiDreamI1, .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage,
++      .wan21_14b, .hiDreamI1, .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage, .mingImage,
+       .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .minimaxH3Image, .mossImage, .cosmos2_5_2b,
+       .cosmos2_5_2_9b, .seedvr2_3b, .seedvr2_7b,
+       .ideogram4, .krea2, .longcatVideoAvatar1_5:
+@@ -5967,7 +5967,7 @@ extension UNetFromNNC {
+       .hiDreamI1,
+       .kandinsky21, .qwenImage, .sd3, .sd3Large, .sdxlBase, .sdxlRefiner, .ssd1b,
+       .svdI2v, .v1, .v2,
+-      .wan21_14b, .wan21_1_3b, .zImage, .cosmos2_5_2b, .cosmos2_5_2_9b, .seedvr2_3b,
++      .wan21_14b, .wan21_1_3b, .zImage, .mingImage, .cosmos2_5_2b, .cosmos2_5_2_9b, .seedvr2_3b,
+       .seedvr2_7b, .ideogram4, .krea2, .longcatVideoAvatar1_5:
+       tileScaleFactor = 8
+     case .hiDreamO1:
+@@ -6215,7 +6215,7 @@ extension UNetFromNNC {
+         c = newC
+       case .v2, .sd3, .sd3Large, .pixart, .auraflow, .kandinsky21, .svdI2v, .wurstchenStageC,
+         .wurstchenStageB, .hunyuanVideo, .wan21_1_3b, .wan21_14b, .hiDreamI1, .hiDreamO1,
+-        .qwenImage, .qwenImage2_1, .wan22_5b, .zImage, .ernieImage, .flux2, .flux2_9b, .flux2_4b,
++        .qwenImage, .qwenImage2_1, .wan22_5b, .zImage, .mingImage, .ernieImage, .flux2, .flux2_9b, .flux2_4b,
+         .flux3_5b, .fibo2, .mossImage,
+         .cosmos2_5_2b, .cosmos2_5_2_9b, .ltx2, .ltx2_3, .seedvr2_3b, .seedvr2_7b,
+         .ideogram4, .krea2,
+@@ -6256,7 +6256,7 @@ extension UNetFromNNC {
+       return x
+     case .v1, .v2, .sd3, .sd3Large, .pixart, .auraflow, .flux1, .sdxlBase, .sdxlRefiner, .ssd1b,
+       .svdI2v, .kandinsky21, .wurstchenStageB, .hunyuanVideo, .wan21_1_3b, .wan21_14b, .hiDreamI1,
+-      .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage, .ernieImage, .flux2, .flux2_9b,
++      .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage, .mingImage, .ernieImage, .flux2, .flux2_9b,
+       .flux2_4b, .flux3_5b, .fibo2, .mossImage, .cosmos2_5_2b, .cosmos2_5_2_9b, .ideogram4, .krea2,
+       .ltx2, .ltx2_3,
+       .seedvr2_3b,
+diff --git a/Libraries/SwiftDiffusion/Sources/Models/ZImage.swift b/Libraries/SwiftDiffusion/Sources/Models/ZImage.swift
+index a4b4e56..98270aa 100644
+--- a/Libraries/SwiftDiffusion/Sources/Models/ZImage.swift
++++ b/Libraries/SwiftDiffusion/Sources/Models/ZImage.swift
+@@ -3,7 +3,8 @@ import Foundation
+ import NNC
+ 
+ public func ZImageRotaryPositionEmbedding(
+-  height: Int, width: Int, tokenLength: Int, imagePaddedLength: Int, heads: Int = 1
++  height: Int, width: Int, tokenLength: Int, imagePaddedLength: Int, heads: Int = 1,
++  imageTimePosition: Int? = nil
+ ) -> Tensor<Float> {
+   var rotTensor = Tensor<Float>(
+     .CPU, .NHWC(1, height * width + imagePaddedLength + tokenLength, heads, 128))
+@@ -15,7 +16,9 @@ public func ZImageRotaryPositionEmbedding(
+       let i = y * width + x
+       for j in 0..<heads {
+         for k in 0..<(dim0 / 2) {
+-          let theta = Double(tokenLength + 1) * 1.0 / pow(256, Double(k) * 2 / Double(dim0))
++          let theta =
++            Double((imageTimePosition ?? tokenLength) + 1) * 1.0
++            / pow(256, Double(k) * 2 / Double(dim0))
+           let sintheta = sin(theta)
+           let costheta = cos(theta)
+           rotTensor[0, i, j, k * 2] = Float(costheta)
+@@ -786,6 +789,106 @@ public func ZImageFixed(
+   return (Model([txt, txtRot, t] + (capPadTokens.map { [$0] } ?? []), outs), mapper)
+ }
+ 
++/// Ming-Image's version of `ZImageFixed`. The caption is the 256 learnable-query features through
++/// `cap_embedder` followed by the language model's own tokens, already `channels` wide
++/// (`direct`), with no padding: the reference pads to a multiple of 32 with zeros and masks the
++/// padding out of attention, which is the same as leaving it out when the image's time position
++/// is taken from the padded length (see `ZImageRotaryPositionEmbedding.imageTimePosition`).
++/// Inputs: queries `[B, queryLength, 2560]`, direct `[B, directLength, channels]`, the caption's
++/// rotary table and the time embedding. Outputs are `ZImageFixed`'s.
++public func MingImageFixed(
++  batchSize: Int, queryLength: Int, directLength: Int, channels: Int, layers: Int,
++  activationQkScaling: [Int: Int], activationProjScaling: [Int: Int],
++  activationFfnProjUpScaling: [Int: Int], activationFfnScaling: [Int: Int],
++  usesFlashAttention: FlashAttentionLevel, isBF16: Bool, contextRefinerLayers: Int = 2
++) -> (
++  Model, ModelWeightMapper
++) {
++  let txt = Input()
++  let direct = Input()
++  let txtRot = Input()
++  let t = Input()
++  let txtNorm = RMSNorm(epsilon: 1e-5, axis: [2], name: "cap_norm")
++  let txtIn = Dense(count: channels, name: "cap_embedder")
++  var txtOut = Functional.concat(axis: 1, txtIn(txtNorm(txt)), direct, flags: .disableOpt)
++  let tokenLength = queryLength + directLength
++  txtOut = txtOut.to(.Float32)
++  let (timeInMlp0, timeInMlp2, timeIn) = MLPEmbedder(
++    channels: 256, intermediateSize: 1024, name: "t")
++  let tOut = timeIn(t)
++  var mappers = [ModelWeightMapper]()
++  for i in 0..<contextRefinerLayers {
++    let qkScaling = activationQkScaling[i] ?? 1
++    let projScaling = activationProjScaling[i] ?? 1
++    let ffnProjUpScaling = activationFfnProjUpScaling[i] ?? 1
++    let ffnScaling = activationFfnScaling[i] ?? 1
++    let (block, mapper) = ZImageTransformerBlock(
++      prefix: "context_refiner.\(i)", name: "context_refiner", k: 128, h: channels / 128,
++      b: batchSize, t: (keyValue: tokenLength, query: tokenLength), segments: [],
++      scaleFactor: (
++        (qk: qkScaling, proj: 2 * projScaling), (projUp: ffnProjUpScaling, projDown: 2 * ffnScaling)
++      ), modulation: false, usesFlashAttention: usesFlashAttention, isBF16: isBF16)
++    txtOut = block(txtOut, txtRot)
++    mappers.append(mapper)
++  }
++  var outs = [txtOut]
++  for i in 0..<2 {
++    let qkScaling = activationQkScaling[i + 2] ?? 1
++    var projScaling = activationProjScaling[i + 2] ?? 1
++    if projScaling < 0 { projScaling = 4 / -projScaling } else { projScaling = 4 * projScaling }
++    let ffnProjUpScaling = activationFfnProjUpScaling[i + 2] ?? 1
++    var ffnScaling = activationFfnScaling[i + 2] ?? 1
++    if ffnScaling < 0 { ffnScaling = 32 / -ffnScaling } else { ffnScaling = 32 * ffnScaling }
++    let (block, mapper) = ZImageTransformerBlockFixed(
++      prefix: "noise_refiner.\(i)", name: "noise_refiner", channels: channels,
++      scaleFactor: (
++        (qk: qkScaling, proj: projScaling), (projUp: ffnProjUpScaling, projDown: ffnScaling)
++      ))
++    outs.append(block(tOut))
++    mappers.append(mapper)
++  }
++  for i in 0..<layers {
++    let qkScaling = activationQkScaling[i + 4] ?? 1
++    var projScaling = activationProjScaling[i + 4] ?? 1
++    if projScaling < 0 { projScaling = 4 / -projScaling } else { projScaling = 4 * projScaling }
++    let ffnProjUpScaling = activationFfnProjUpScaling[i + 4] ?? 1
++    var ffnScaling = activationFfnScaling[i + 4] ?? 1
++    if ffnScaling < 0 { ffnScaling = 32 / -ffnScaling } else { ffnScaling = 32 * ffnScaling }
++    let (block, mapper) = ZImageTransformerBlockFixed(
++      prefix: "layers.\(i)", name: "", channels: channels,
++      scaleFactor: (
++        (qk: qkScaling, proj: projScaling), (projUp: ffnProjUpScaling, projDown: ffnScaling)
++      ))
++    outs.append(block(tOut))
++    mappers.append(mapper)
++  }
++  let scale = Dense(count: channels, name: "ada_ln_final")
++  outs.append(1 + scale(tOut.swish()))
++  let mapper: ModelWeightMapper = { format in
++    var mapping = ModelWeightMapping()
++    mapping["cap_embedder.0.weight"] = [txtNorm.weight.name]
++    mapping["cap_embedder.1.weight"] = [txtIn.weight.name]
++    mapping["cap_embedder.1.bias"] = [txtIn.bias.name]
++    mapping["t_embedder.mlp.0.weight"] = [timeInMlp0.weight.name]
++    mapping["t_embedder.mlp.0.bias"] = [timeInMlp0.bias.name]
++    mapping["t_embedder.mlp.2.weight"] = [timeInMlp2.weight.name]
++    mapping["t_embedder.mlp.2.bias"] = [timeInMlp2.bias.name]
++    for mapper in mappers {
++      mapping.merge(mapper(format)) { v, _ in v }
++    }
++    switch format {
++    case .generativeModels:
++      mapping["final_layer.adaLN_modulation.1.weight"] = [scale.weight.name]
++      mapping["final_layer.adaLN_modulation.1.bias"] = [scale.bias.name]
++    case .diffusers:
++      mapping["all_final_layer.2-1.adaLN_modulation.1.weight"] = [scale.weight.name]
++      mapping["all_final_layer.2-1.adaLN_modulation.1.bias"] = [scale.bias.name]
++    }
++    return mapping
++  }
++  return (Model([txt, direct, txtRot, t], outs), mapper)
++}
++
+ private func ZImageTransformerBlockFixedOutputShapes(
+   prefix: String, name: String, batchSize: Int, channels: Int
+ ) -> [TensorShape] {
+diff --git a/Libraries/SwiftDiffusion/Sources/Samplers/Sampler.swift b/Libraries/SwiftDiffusion/Sources/Samplers/Sampler.swift
+index e74edb7..eb8a437 100644
+--- a/Libraries/SwiftDiffusion/Sources/Samplers/Sampler.swift
++++ b/Libraries/SwiftDiffusion/Sources/Samplers/Sampler.swift
+@@ -43,6 +43,7 @@ public enum ModelVersion: String, Codable {
+   case minimaxH3 = "minimax_h3"
+   case minimaxH3Image = "minimax_h3_image"
+   case mossImage = "moss_image"
++  case mingImage = "ming_image"
+ }
+ 
+ public enum TextEncoderVersion: String, Codable {
+@@ -549,7 +550,7 @@ func isBatchEnabled(_ version: ModelVersion) -> Bool {
+   switch version {
+   case .auraflow, .flux1, .hiDreamI1, .hiDreamO1, .kandinsky21, .pixart, .sd3, .sd3Large, .sdxlBase,
+     .sdxlRefiner, .ssd1b, .v1, .v2, .wurstchenStageB, .wurstchenStageC, .qwenImage, .qwenImage2_1,
+-    .zImage, .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .mossImage, .cosmos2_5_2b,
++    .zImage, .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .mossImage, .mingImage, .cosmos2_5_2b,
+     .cosmos2_5_2_9b,
+     .ideogram4,
+     .krea2:
+diff --git a/Libraries/SwiftDiffusion/Sources/TeaCache/TeaCache.swift b/Libraries/SwiftDiffusion/Sources/TeaCache/TeaCache.swift
+index 4a44409..c3263e3 100644
+--- a/Libraries/SwiftDiffusion/Sources/TeaCache/TeaCache.swift
++++ b/Libraries/SwiftDiffusion/Sources/TeaCache/TeaCache.swift
+@@ -23,7 +23,7 @@ public struct TeaCacheConfiguration {
+     case .v1, .v2, .kandinsky21, .sdxlBase, .sdxlRefiner, .ssd1b, .svdI2v, .wurstchenStageC,
+       .wurstchenStageB, .sd3, .pixart, .auraflow, .flux1, .sd3Large, .hunyuanVideo, .wan21_1_3b,
+       .wan21_14b, .hiDreamI1, .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage,
+-      .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .minimaxH3Image, .mossImage, .cosmos2_5_2b,
++      .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .minimaxH3Image, .mossImage, .mingImage, .cosmos2_5_2b,
+       .cosmos2_5_2_9b, .ideogram4,
+       .krea2,
+       .ltx2, .ltx2_3,
+@@ -85,7 +85,7 @@ final class TeaCache<FloatType: TensorNumeric & BinaryFloatingPoint> {
+     case .v1, .v2, .kandinsky21, .sdxlBase, .sdxlRefiner, .ssd1b, .svdI2v, .wurstchenStageC,
+       .wurstchenStageB, .sd3, .pixart, .auraflow, .flux1, .sd3Large, .hunyuanVideo, .wan21_1_3b,
+       .wan21_14b, .hiDreamI1, .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage,
+-      .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .minimaxH3Image, .mossImage, .cosmos2_5_2b,
++      .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .minimaxH3Image, .mossImage, .mingImage, .cosmos2_5_2b,
+       .cosmos2_5_2_9b, .ideogram4,
+       .krea2,
+       .ltx2, .ltx2_3,
+@@ -141,7 +141,7 @@ final class TeaCache<FloatType: TensorNumeric & BinaryFloatingPoint> {
+     case .v1, .v2, .kandinsky21, .sdxlBase, .sdxlRefiner, .ssd1b, .svdI2v, .wurstchenStageC,
+       .wurstchenStageB, .sd3, .pixart, .auraflow, .sd3Large, .wan21_14b, .wan21_1_3b, .hiDreamI1,
+       .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage, .ernieImage, .flux2, .flux2_9b,
+-      .flux2_4b, .flux3_5b, .fibo2, .minimaxH3Image, .mossImage, .cosmos2_5_2b, .cosmos2_5_2_9b, .ideogram4, .krea2,
++      .flux2_4b, .flux3_5b, .fibo2, .minimaxH3Image, .mossImage, .mingImage, .cosmos2_5_2b, .cosmos2_5_2_9b, .ideogram4, .krea2,
+       .ltx2, .ltx2_3,
+       .seedvr2_3b,
+       .seedvr2_7b,
+@@ -223,7 +223,7 @@ final class TeaCache<FloatType: TensorNumeric & BinaryFloatingPoint> {
+         inputs: [placeholder, inputs[3]] + Array(inputs.suffix(4)) + [placeholder])
+     case .v1, .v2, .kandinsky21, .sdxlBase, .sdxlRefiner, .ssd1b, .svdI2v, .wurstchenStageC,
+       .wurstchenStageB, .sd3, .pixart, .auraflow, .sd3Large, .qwenImage, .qwenImage2_1, .wan22_5b,
+-      .zImage, .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .minimaxH3Image, .mossImage, .cosmos2_5_2b,
++      .zImage, .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .minimaxH3Image, .mossImage, .mingImage, .cosmos2_5_2b,
+       .cosmos2_5_2_9b,
+       .ltx2, .ltx2_3,
+       .seedvr2_3b, .seedvr2_7b, .hiDreamO1, .ideogram4, .krea2, .longcatVideoAvatar1_5:
+@@ -295,7 +295,7 @@ final class TeaCache<FloatType: TensorNumeric & BinaryFloatingPoint> {
+     case .v1, .v2, .kandinsky21, .sdxlBase, .sdxlRefiner, .ssd1b, .svdI2v, .wurstchenStageC,
+       .wurstchenStageB, .sd3, .pixart, .auraflow, .sd3Large, .hunyuanVideo, .wan21_1_3b, .wan21_14b,
+       .hiDreamI1, .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage, .ernieImage, .flux2,
+-      .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .minimaxH3Image, .mossImage, .cosmos2_5_2b, .cosmos2_5_2_9b,
++      .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .minimaxH3Image, .mossImage, .mingImage, .cosmos2_5_2b, .cosmos2_5_2_9b,
+       .ideogram4, .krea2, .ltx2,
+       .ltx2_3,
+       .seedvr2_3b,
+diff --git a/Libraries/SwiftDiffusion/Sources/TextEncoder.swift b/Libraries/SwiftDiffusion/Sources/TextEncoder.swift
+index 9d167ee..44df0f5 100644
+--- a/Libraries/SwiftDiffusion/Sources/TextEncoder.swift
++++ b/Libraries/SwiftDiffusion/Sources/TextEncoder.swift
+@@ -4754,6 +4754,9 @@ extension TextEncoder {
+     case .flux3_5b:
+       return encodeFlux3(
+         tokens: tokens, tokenLengthUncond: &tokenLengthUncond, tokenLengthCond: &tokenLengthCond)
++    case .mingImage:
++      // Not written yet: see docs/superpowers/specs/2026-11-23-ming-image-design.md in DT Hub.
++      fatalError("Ming Image text encoder is not implemented yet (converter only).")
+     case .mossImage:
+       return encodeMOSSImage(
+         tokens: tokens, tokenLengthUncond: tokenLengthUncond, tokenLengthCond: tokenLengthCond)
+@@ -4898,7 +4901,7 @@ extension TextEncoder {
+       case .sd3, .sd3Large, .pixart, .auraflow, .flux1, .kandinsky21, .sdxlBase, .sdxlRefiner,
+         .ssd1b, .svdI2v, .wurstchenStageC, .wurstchenStageB, .hunyuanVideo, .wan21_1_3b, .wan21_14b,
+         .hiDreamI1, .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage, .ernieImage, .flux2,
+-        .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .cosmos2_5_2b, .cosmos2_5_2_9b,
++        .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .mingImage, .cosmos2_5_2b, .cosmos2_5_2_9b,
+         .ideogram4, .krea2, .ltx2,
+         .ltx2_3,
+         .seedvr2_3b,
+@@ -4941,7 +4944,7 @@ extension TextEncoder {
+                   .sdxlRefiner, .ssd1b, .svdI2v, .wurstchenStageC, .wurstchenStageB, .hunyuanVideo,
+                   .wan21_1_3b, .wan21_14b, .hiDreamI1, .hiDreamO1, .qwenImage, .qwenImage2_1,
+                   .wan22_5b, .zImage, .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2,
+-                  .mossImage,
++                  .mossImage, .mingImage,
+                   .cosmos2_5_2b, .cosmos2_5_2_9b,
+                   .ltx2, .ltx2_3, .seedvr2_3b, .seedvr2_7b, .ideogram4, .krea2,
+                   .longcatVideoAvatar1_5, .minimaxH3, .minimaxH3Image:
+@@ -4985,7 +4988,7 @@ extension TextEncoder {
+                 .sdxlRefiner, .ssd1b, .svdI2v, .wurstchenStageC, .wurstchenStageB, .hunyuanVideo,
+                 .wan21_1_3b, .wan21_14b, .hiDreamI1, .hiDreamO1, .qwenImage, .qwenImage2_1,
+                 .wan22_5b, .zImage, .ernieImage, .flux2, .flux2_9b, .flux2_4b, .flux3_5b, .fibo2,
+-                .mossImage,
++                .mossImage, .mingImage,
+                 .cosmos2_5_2b, .cosmos2_5_2_9b, .ltx2,
+                 .ltx2_3, .seedvr2_3b, .seedvr2_7b, .ideogram4, .krea2, .longcatVideoAvatar1_5,
+                 .minimaxH3, .minimaxH3Image:
+diff --git a/Libraries/SwiftDiffusion/Sources/UNetFixedEncoder.swift b/Libraries/SwiftDiffusion/Sources/UNetFixedEncoder.swift
+index eef2415..e3aa42d 100644
+--- a/Libraries/SwiftDiffusion/Sources/UNetFixedEncoder.swift
++++ b/Libraries/SwiftDiffusion/Sources/UNetFixedEncoder.swift
+@@ -57,7 +57,7 @@ extension UNetFixedEncoder {
+     case .sdxlBase, .sdxlRefiner, .ssd1b, .svdI2v, .sd3, .sd3Large, .pixart, .auraflow, .flux1,
+       .wurstchenStageC, .wurstchenStageB, .hunyuanVideo, .wan21_1_3b, .wan21_14b, .hiDreamI1,
+       .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage, .ernieImage, .flux2, .flux2_9b,
+-      .flux2_4b, .flux3_5b, .fibo2, .mossImage, .cosmos2_5_2b, .cosmos2_5_2_9b, .ltx2, .ltx2_3,
++      .flux2_4b, .flux3_5b, .fibo2, .mossImage, .mingImage, .cosmos2_5_2b, .cosmos2_5_2_9b, .ltx2, .ltx2_3,
+       .seedvr2_3b, .seedvr2_7b,
+       .ideogram4,
+       .krea2,
+@@ -205,7 +205,7 @@ extension UNetFixedEncoder {
+       return []
+     case .sd3, .sd3Large, .pixart, .auraflow, .flux1, .hunyuanVideo, .wan21_1_3b, .wan21_14b,
+       .hiDreamI1, .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage, .ernieImage, .flux2,
+-      .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .cosmos2_5_2b, .cosmos2_5_2_9b, .ltx2,
++      .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .mingImage, .cosmos2_5_2b, .cosmos2_5_2_9b, .ltx2,
+       .ltx2_3, .seedvr2_3b,
+       .seedvr2_7b,
+       .ideogram4,
+@@ -1343,7 +1343,7 @@ extension UNetFixedEncoder {
+       case .v1, .v2, .auraflow, .flux1, .kandinsky21, .pixart, .sdxlBase, .sdxlRefiner, .ssd1b,
+         .svdI2v, .wurstchenStageB, .wurstchenStageC, .hunyuanVideo, .wan21_1_3b, .wan21_14b,
+         .hiDreamI1, .hiDreamO1, .qwenImage, .qwenImage2_1, .wan22_5b, .zImage, .ernieImage, .flux2,
+-        .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .cosmos2_5_2b, .cosmos2_5_2_9b, .ltx2,
++        .flux2_9b, .flux2_4b, .flux3_5b, .fibo2, .mossImage, .mingImage, .cosmos2_5_2b, .cosmos2_5_2_9b, .ltx2,
+         .ltx2_3, .seedvr2_3b,
+         .seedvr2_7b,
+         .ideogram4,
+@@ -3032,6 +3032,9 @@ extension UNetFixedEncoder {
+         ]
+       }
+       return (rotaryEmbeddings + conditions, nil)
++    case .mingImage:
++      // Not written yet: see docs/superpowers/specs/2026-11-23-ming-image-design.md in DT Hub.
++      fatalError("Ming Image is not implemented in the generation engine yet (converter only).")
+     case .mossImage:
+       precondition(timesteps.count > 0)
+       let c0 = textEncoding[0]
+diff --git a/Package.swift b/Package.swift
+index a7edfbd..ea0910c 100644
+--- a/Package.swift
++++ b/Package.swift
+@@ -492,6 +492,34 @@ let package = Package(
+       path: "Apps/ModelConverter",
+       sources: ["Converter.swift"]
+     ),
++    .executableTarget(
++      name: "MingEncoderTest",
++      dependencies: [
++        "Diffusion",
++        "ModelOp",
++        .product(name: "NNC", package: "s4nnc"),
++      ],
++      path: "Apps/MingEncoderTest",
++      sources: ["main.swift"]
++    ),
++    .executableTarget(
++      name: "MingVAETest",
++      dependencies: [
++        "Diffusion",
++        .product(name: "NNC", package: "s4nnc"),
++      ],
++      path: "Apps/MingVAETest",
++      sources: ["main.swift"]
++    ),
++    .executableTarget(
++      name: "MingDiTTest",
++      dependencies: [
++        "Diffusion",
++        .product(name: "NNC", package: "s4nnc"),
++      ],
++      path: "Apps/MingDiTTest",
++      sources: ["main.swift"]
++    ),
+     .executableTarget(
+       name: "QuantI8x",
+       dependencies: [
+-- 
+2.54.0 (Apple Git-157)
+

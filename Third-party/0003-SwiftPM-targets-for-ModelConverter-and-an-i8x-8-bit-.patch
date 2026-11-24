@@ -1,7 +1,7 @@
-From 500c99590403f11861d2e1e349807062247435db Mon Sep 17 00:00:00 2001
+From a1637c66424454c901a43c3d1f64aee7962e133b Mon Sep 17 00:00:00 2001
 From: Antonio D'Achille <existenz70@gmail.com>
 Date: Thu, 19 Nov 2026 13:00:49 +0100
-Subject: [PATCH 1/2] SwiftPM targets for ModelConverter and an i8x (8-bit S)
+Subject: [PATCH 3/7] SwiftPM targets for ModelConverter and an i8x (8-bit S)
  quantizer
 
 Used by the Fibo 2.0 converter app.
@@ -372,7 +372,7 @@ index 0000000..a68237d
 +  }
 +}
 diff --git a/Package.swift b/Package.swift
-index 0efa1cf..6293811 100644
+index a8647f3..a7edfbd 100644
 --- a/Package.swift
 +++ b/Package.swift
 @@ -480,6 +480,28 @@ let package = Package(
