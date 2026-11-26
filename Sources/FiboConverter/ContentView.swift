@@ -189,6 +189,7 @@ struct ContentView: View {
       GenericView().tabItem { Text("Any safetensors") }
       H3View().tabItem { Text("MiniMax H3 Image") }
       MingView().tabItem { Text("Ming-Image") }
+      MingLayerView().tabItem { Text("Ming Layer") }
     }
     .padding(.top, 8)
   }

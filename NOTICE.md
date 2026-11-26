@@ -4,12 +4,14 @@
 `ModelConverter` and `QuantI8x`. Both are built from the Draw Things community engine
 (<https://github.com/drawthingsai/draw-things-community>, GPL-3.0), using the
 `atelier-engine` branch of <https://github.com/ianiv/draw-things-community> at commit
-`f4d03b0` (the engine of DT Hub's server) plus the seven patches in `Third-party/` (apply in order with `git am`):
+`f4d03b0` (the engine of DT Hub's server) plus the seventeen patches in `Third-party/` (apply in order with `git am`):
 `0001` Krea 2 reference images and `0002` the per-request scheduler (DT Hub's server patch); `0003` SwiftPM targets for
 `ModelConverter` and for `QuantI8x`, an i8x/8-bit S variant of the upstream quantizer; `0004` the MiniMax H3 Image rule
 (following Atelier's `MOSSImporter.quantize`, <https://github.com/ianiv/Atelier>, GPL-3.0); `0005`-`0007` Ming-Image
 (converters for the model, text encoder, vision tower and VAE, its 8-bit S rule, the engine code to run it, editing, and
-Z-Image LoRAs on it).
+Z-Image LoRAs on it); `0008`-`0010` Ming-Image Design-Layer (the connector-only conversion of its text encoder and the
+engine code to run it); `0011`-`0017` seamless tiling (DT Hub's server patch). The tree they give is the engine of DT Hub
+1.10.0's server.
 
 That is the complete corresponding source for the bundled binaries: check out that commit,
 apply the patches, and run `swift build -c release --product ModelConverter --product QuantI8x`.

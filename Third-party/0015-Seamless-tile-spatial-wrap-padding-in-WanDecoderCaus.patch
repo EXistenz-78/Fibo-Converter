@@ -1,0 +1,409 @@
+From bcdc18f3aaafbd7cc1534f5ca78337e4a92acc4b Mon Sep 17 00:00:00 2001
+From: Antonio D'Achille <existenz70@gmail.com>
+Date: Wed, 25 Nov 2026 12:08:14 +0100
+Subject: [PATCH 15/17] Seamless tile: spatial wrap padding in
+ WanDecoderCausal3D (Krea 2)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Apps/SeamlessTileTest/main.swift              | 103 ++++++++++++++
+ .../Sources/Models/WanVAE.swift               | 132 +++++++++++++-----
+ 2 files changed, 202 insertions(+), 33 deletions(-)
+
+diff --git a/Apps/SeamlessTileTest/main.swift b/Apps/SeamlessTileTest/main.swift
+index bbd9ed4..b01c6f3 100644
+--- a/Apps/SeamlessTileTest/main.swift
++++ b/Apps/SeamlessTileTest/main.swift
+@@ -512,6 +512,109 @@ for (specializingNames, value) in [(false, Int8(3)), (true, Int8(3)), (true, Int
+     "the plain Decoder does not commute with the shift (\(plainDifference))")
+ }
+ 
++// MARK: Wrap padding in the Wan VAE decoder (Krea 2).
++
++// On one frame the causal 3x3x3 convolution is a 3x3 one: with wrap it equals the same convolution
++// on the 3x3 tile, cropped to the center; the other axis keeps its zero border. The input is not
++// square (4x6) so a swapped height and width would show.
++do {
++  let input = randomTensor([1, 4, 6, 4])
++  var weight = Tensor<Float>(.CPU, .NCHW(3, 4, 3, 3))
++  for o in 0..<3 {
++    for i in 0..<4 {
++      for y in 0..<3 {
++        for x in 0..<3 { weight[o, i, y, x] = Float.random(in: -1...1) }
++      }
++    }
++  }
++  var bias = Tensor<Float>(.CPU, .C(3))
++  for o in 0..<3 { bias[o] = Float.random(in: -1...1) }
++  for (value, rows, columns) in [(Int8(3), 3, 3), (Int8(2), 3, 1), (Int8(1), 1, 3)] {
++    let wrap = SeamlessTile(configurationValue: value)!
++    let (conv, apply) = WanFrameConvolution(filters: 3, wrap: wrap, name: "resnet_conv1")
++    let x = Input()
++    let wrapping = Model([x], [apply(x, (depth: 1, height: 4, width: 6, channels: 4))])
++    wrapGraph.withNoGrad {
++      wrapping.compile(inputs: wrapGraph.variable(input.toGPU(0)))
++    }
++    conv.weight.copy(from: weight)
++    conv.bias.copy(from: bias)
++    let (reference, applyReference) = WanFrameConvolution(filters: 3, wrap: nil, name: "")
++    let tile = tiled(input, rows: rows, columns: columns)
++    let y = Input()
++    let plain = Model([y], [applyReference(y, (depth: 1, height: 4 * rows, width: 6 * columns, channels: 4))])
++    wrapGraph.withNoGrad {
++      plain.compile(inputs: wrapGraph.variable(tile.toGPU(0)))
++    }
++    reference.weight.copy(from: weight)
++    reference.bias.copy(from: bias)
++    let out = runModel(wrapping, input)
++    let expected = runModel(plain, tile)
++    check(out.shape[1] == 4 && out.shape[2] == 6, "Wan frame conv \(value) keeps 4x6")
++    let difference = maxDifference(
++      out, expected, top: rows == 3 ? 4 : 0, left: columns == 3 ? 6 : 0)
++    check(difference < 1e-4, "Wan frame conv \(value) matches the tile (\(difference))")
++  }
++}
++
++// WanDecoderCausal3D on one frame: the same parameter names with and without wrap (the plain one
++// reads the wrapping one's file strictly), and the wrapping decoder commutes with a circular shift
++// on its wrapped axes (RMS norm and attention don't see positions, every padded convolution is
++// circular; two upsamplings make a 1-latent shift a 4-pixel one). The plain decoder does not.
++for value in [Int8(3), Int8(1), Int8(2)] {
++  let wrap = SeamlessTile(configurationValue: value)!
++  func makeWanDecoder(wrap: SeamlessTile?) -> Model {
++    return WanDecoderCausal3D(
++      channels: [8, 16, 16], numRepeat: 1, startWidth: 6, startHeight: 4, startDepth: 1,
++      paddingFinalConvLayer: true, wan22: false, outputChannels: 3,
++      highPrecisionFinalNorm: false, usesFlashAttention: false, format: .NHWC, wrap: wrap
++    ).1
++  }
++  let latent = randomTensor([1, 4, 6, 16])
++  let dy = wrap.wrapsHeight ? 1 : 0
++  let dx = wrap.wrapsWidth ? 1 : 0
++  let wrapping = makeWanDecoder(wrap: wrap)
++  let plain = makeWanDecoder(wrap: nil)
++  let out = runModel(wrapping, latent)
++  _ = runModel(plain, latent)
++  let directory = FileManager.default.temporaryDirectory
++  let wrapPath = directory.appendingPathComponent("seamless-\(UUID().uuidString).ckpt").path
++  let plainPath = directory.appendingPathComponent("seamless-\(UUID().uuidString).ckpt").path
++  defer {
++    try? FileManager.default.removeItem(atPath: wrapPath)
++    try? FileManager.default.removeItem(atPath: plainPath)
++  }
++  let wrapKeys = decoderKeys(wrapping, wrapPath)
++  let plainKeys = decoderKeys(plain, plainPath)
++  check(
++    !wrapKeys.isEmpty && wrapKeys == plainKeys,
++    "WanDecoderCausal3D parameter names are the same with wrap \(value)")
++  var readError: Error? = nil
++  wrapGraph.openStore(wrapPath, flags: .readOnly) { store in
++    do {
++      try store.read("decoder", model: plain, strict: true)
++    } catch {
++      readError = error
++    }
++  }
++  check(readError == nil, "the plain WanDecoderCausal3D reads the wrapping one's weights")
++  check(
++    out.shape[0] == 1 && out.shape[1] == 16 && out.shape[2] == 24 && out.shape[3] == 4,
++    "WanDecoderCausal3D output 1x16x24x4 (\(out.shape))")
++  let shifted = runModel(wrapping, rolled(latent, dy, dx))
++  let difference = maxDifference(rolled(out, 4 * dy, 4 * dx), shifted, top: 0, left: 0)
++  check(
++    difference < 1e-3,
++    "WanDecoderCausal3D with wrap \(value) commutes with the shift (\(difference))")
++  let plainOut = runModel(plain, latent)
++  let plainShifted = runModel(plain, rolled(latent, dy, dx))
++  let plainDifference = maxDifference(
++    rolled(plainOut, 4 * dy, 4 * dx), plainShifted, top: 0, left: 0)
++  check(
++    plainDifference > 1e-2,
++    "the plain WanDecoderCausal3D does not commute with the shift (\(plainDifference))")
++}
++
+ print("SeamlessTileTest: all passed")
+ 
+ // MARK: Frozen copies of the formulas as they were before the seamless parameter.
+diff --git a/Libraries/SwiftDiffusion/Sources/Models/WanVAE.swift b/Libraries/SwiftDiffusion/Sources/Models/WanVAE.swift
+index 603d20e..8e15eac 100644
+--- a/Libraries/SwiftDiffusion/Sources/Models/WanVAE.swift
++++ b/Libraries/SwiftDiffusion/Sources/Models/WanVAE.swift
+@@ -1,24 +1,71 @@
+ import DiffusionMappings
+ import NNC
+ 
++/// The 3x3 convolution of the Wan decoder on a single frame (a causal 3x3x3 convolution reduces to
++/// it: the loader keeps the last temporal slice of its weights), with its 1-pixel spatial border.
++/// With `wrap == nil` it is exactly today's `Convolution` (same name, same zero border). With
++/// `wrap` the border on each wrapped axis comes from the opposite side (`WrapPad`) and the
++/// convolution's own border there is 0; the other axis keeps its zero border. Returns the
++/// convolution (for its weights) and the function that applies it to an NHWC input of the given
++/// shape (the depth is the batch). The shape matters only with `wrap`.
++public func WanFrameConvolution(filters: Int, wrap: SeamlessTile?, name: String) -> (
++  Convolution, (Model.IO, (depth: Int, height: Int, width: Int, channels: Int)) -> Model.IO
++) {
++  guard let wrap = wrap else {
++    let conv = Convolution(
++      groups: 1, filters: filters, filterSize: [3, 3],
++      hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])),
++      format: .OIHW, name: name)
++    return (conv, { x, _ in conv(x) })
++  }
++  let borderHeight = wrap.wrapsHeight ? 0 : 1
++  let borderWidth = wrap.wrapsWidth ? 0 : 1
++  let conv = Convolution(
++    groups: 1, filters: filters, filterSize: [3, 3],
++    hint: Hint(
++      stride: [1, 1],
++      border: Hint.Border(begin: [borderHeight, borderWidth], end: [borderHeight, borderWidth])),
++    format: .OIHW, name: name)
++  return (
++    conv,
++    { x, shape in
++      guard wrap.wrapsHeight || wrap.wrapsWidth else { return conv(x) }
++      let pad = WrapPad(
++        batchSize: shape.depth, height: shape.height, width: shape.width,
++        channels: shape.channels, top: 1, left: 1, wrapsHeight: wrap.wrapsHeight,
++        wrapsWidth: wrap.wrapsWidth)
++      return conv(pad(x))
++    }
++  )
++}
++
+ private struct NHWCResnetBlockCausal3D {
+   private let norm1: Model
+   private let conv1: Model
+   private let norm2: Model
+   private let conv2: Model
+   private let ninShortcut: Model?
+-  init(outChannels: Int, shortcut: Bool, startDepth: Int) {
++  // On a single frame: the 2D convolutions applied with their (optionally wrapping) padding.
++  private let applyFrameConv1:
++    ((Model.IO, (depth: Int, height: Int, width: Int, channels: Int)) -> Model.IO)?
++  private let applyFrameConv2:
++    ((Model.IO, (depth: Int, height: Int, width: Int, channels: Int)) -> Model.IO)?
++  /// `wrap` pads the single-frame convolutions circularly (see `WanFrameConvolution`); it needs
++  /// `startDepth == 1`.
++  init(outChannels: Int, shortcut: Bool, startDepth: Int, wrap: SeamlessTile? = nil) {
++    precondition(wrap == nil || startDepth == 1, "Wan resnet block: wrap needs a single frame")
+     norm1 = RMSNorm(epsilon: 1e-6, axis: [3], name: "resnet_norm1")
+     if startDepth > 1 {
+       conv1 = Convolution(
+         groups: 1, filters: outChannels, filterSize: [3, 3, 3],
+         hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])),
+         format: .OIHW, name: "resnet_conv1")
++      applyFrameConv1 = nil
+     } else {
+-      conv1 = Convolution(
+-        groups: 1, filters: outChannels, filterSize: [3, 3],
+-        hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])),
+-        format: .OIHW, name: "resnet_conv1")
++      let (conv, apply) = WanFrameConvolution(
++        filters: outChannels, wrap: wrap, name: "resnet_conv1")
++      conv1 = conv
++      applyFrameConv1 = apply
+     }
+     norm2 = RMSNorm(epsilon: 1e-6, axis: [3], name: "resnet_norm2")
+     if startDepth > 1 {
+@@ -26,11 +73,12 @@ private struct NHWCResnetBlockCausal3D {
+         groups: 1, filters: outChannels, filterSize: [3, 3, 3],
+         hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])),
+         format: .OIHW, name: "resnet_conv2")
++      applyFrameConv2 = nil
+     } else {
+-      conv2 = Convolution(
+-        groups: 1, filters: outChannels, filterSize: [3, 3],
+-        hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])),
+-        format: .OIHW, name: "resnet_conv2")
++      let (conv, apply) = WanFrameConvolution(
++        filters: outChannels, wrap: wrap, name: "resnet_conv2")
++      conv2 = conv
++      applyFrameConv2 = apply
+     }
+     if shortcut {
+       ninShortcut = Convolution(
+@@ -63,6 +111,8 @@ private struct NHWCResnetBlockCausal3D {
+           pre.padded(.zero, begin: [2, 1, 1, 0], end: [0, 1, 1, 0]).reshaped([
+             1, depth + 2, height + 2, width + 2, inChannels,
+           ]))
++      } else if let applyFrameConv1 = applyFrameConv1 {
++        out = applyFrameConv1(pre, (depth, height, width, inChannels))
+       } else {
+         out = conv1(pre)
+       }
+@@ -92,6 +142,8 @@ private struct NHWCResnetBlockCausal3D {
+           pre.padded(.zero, begin: [2, 1, 1, 0], end: [0, 1, 1, 0]).reshaped([
+             1, depth + 2, height + 2, width + 2, outChannels,
+           ]))
++      } else if let applyFrameConv2 = applyFrameConv2 {
++        out = applyFrameConv2(pre, (depth, height, width, outChannels))
+       } else {
+         out = conv2(pre)
+       }
+@@ -203,13 +255,16 @@ private struct NHWCAttnBlockCausal3D {
+ // 1. The channel is not halved at the resample convolution time (Wan 2.2);
+ // 2. The input is 48-channel, output is 12-channel and pixel shuffle back to 2x;
+ // 3. There is a separate upsample shortcut such that the higher resolution res blocks should only learn high-frequency information.
++// `wrap` (seamless tile, a single frame only) pads every spatial 3x3 convolution circularly on the
++// wrapped axes; nil builds today's graph.
+ private func NHWCWanDecoderCausal3D(
+   channels: [Int], numRepeat: Int, startWidth: Int, startHeight: Int,
+   startDepth: Int, paddingFinalConvLayer: Bool, wan22: Bool, outputChannels: Int,
+-  highPrecisionFinalNorm: Bool, usesFlashAttention: Bool
++  highPrecisionFinalNorm: Bool, usesFlashAttention: Bool, wrap: SeamlessTile?
+ )
+   -> (ModelWeightMapper, Model)
+ {
++  precondition(wrap == nil || startDepth == 1, "WanDecoderCausal3D: wrap needs a single frame")
+   let x = Input()
+   var previousChannel = channels[channels.count - 1]
+   let inputChannels = wan22 ? 48 : 16
+@@ -219,6 +274,10 @@ private func NHWCWanDecoderCausal3D(
+   let postQuantX = postQuantConv(x)
+   let convIn: Model
+   let convOut: Model
++  var applyFrameConvIn:
++    ((Model.IO, (depth: Int, height: Int, width: Int, channels: Int)) -> Model.IO)? = nil
++  var applyFrameConvOut:
++    ((Model.IO, (depth: Int, height: Int, width: Int, channels: Int)) -> Model.IO)? = nil
+   if startDepth > 1 {
+     convIn = Convolution(
+       groups: 1, filters: previousChannel, filterSize: [3, 3, 3],
+@@ -231,31 +290,31 @@ private func NHWCWanDecoderCausal3D(
+       hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])),
+       format: .OIHW, name: "conv_out")
+   } else {
+-    convIn = Convolution(
+-      groups: 1, filters: previousChannel, filterSize: [3, 3],
+-      hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])),
+-      format: .OIHW, name: "conv_in")
+-    convOut = Convolution(
+-      groups: 1,
++    let (frameConvIn, applyConvIn) = WanFrameConvolution(
++      filters: previousChannel, wrap: wrap, name: "conv_in")
++    convIn = frameConvIn
++    applyFrameConvIn = applyConvIn
++    let (frameConvOut, applyConvOut) = WanFrameConvolution(
+       filters: wan22 ? 12 : (paddingFinalConvLayer ? (outputChannels + 3) / 4 * 4 : outputChannels),
+-      filterSize: [3, 3],
+-      hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])),
+-      format: .OIHW, name: "conv_out")
++      wrap: wrap, name: "conv_out")
++    convOut = frameConvOut
++    applyFrameConvOut = applyConvOut
+   }
+   let normOut = RMSNorm(epsilon: 1e-6, axis: [3], name: "norm_out")
+   var last: Model.IO? = nil
+   var midBlock1Builder = NHWCResnetBlockCausal3D(
+-    outChannels: previousChannel, shortcut: false, startDepth: startDepth)
++    outChannels: previousChannel, shortcut: false, startDepth: startDepth, wrap: wrap)
+   let midAttn1Builder = NHWCAttnBlockCausal3D(
+     inChannels: previousChannel, usesFlashAttention: usesFlashAttention)
+   var midBlock2Builder = NHWCResnetBlockCausal3D(
+-    outChannels: previousChannel, shortcut: false, startDepth: startDepth)
++    outChannels: previousChannel, shortcut: false, startDepth: startDepth, wrap: wrap)
+   var upBlockBuilders = [NHWCResnetBlockCausal3D]()
+   for (i, channel) in channels.enumerated().reversed() {
+     for _ in 0..<numRepeat + 1 {
+       upBlockBuilders.append(
+         NHWCResnetBlockCausal3D(
+-          outChannels: channel, shortcut: previousChannel != channel, startDepth: startDepth))
++          outChannels: channel, shortcut: previousChannel != channel, startDepth: startDepth,
++          wrap: wrap))
+       previousChannel = channel
+     }
+     if i > 0 && !wan22 {
+@@ -270,10 +329,7 @@ private func NHWCWanDecoderCausal3D(
+   }
+   let upsampleConv2d = (0..<(channels.count - 1)).map { i in
+     let channels = wan22 ? channels[channels.count - i - 1] : channels[channels.count - i - 1] / 2
+-    return Convolution(
+-      groups: 1, filters: channels, filterSize: [3, 3],
+-      hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])),
+-      format: .OIHW, name: "upsample")
++    return WanFrameConvolution(filters: channels, wrap: wrap, name: "upsample")
+   }
+   var timeInputs: [Model.IO?] = Array(repeating: nil, count: channels.count - 2)
+   var convOutInputs: Model.IO? = nil
+@@ -295,6 +351,8 @@ private func NHWCWanDecoderCausal3D(
+             1, min(startDepth - d, 3) + 2, startHeight + 2, startWidth + 2, inputChannels,
+           ])
+         ).reshaped([min(startDepth - d, 3), startHeight, startWidth, previousChannel])
++      } else if let applyFrameConvIn = applyFrameConvIn {
++        out = applyFrameConvIn(out, (1, startHeight, startWidth, inputChannels))
+       } else {
+         out = convIn(out)
+       }
+@@ -466,7 +524,7 @@ private func NHWCWanDecoderCausal3D(
+             depth = depth * 2
+           }
+         }
+-        let conv2d = upsampleConv2d[channels.count - i - 1]
++        let (conv2d, applyConv2d) = upsampleConv2d[channels.count - i - 1]
+         // The convolution returns garbage once its input exceeds 2^31 elements (1080p video with 9
+         // frames is ~2^31.75), so upsample and convolve high-resolution video in frame groups.
+         let framesPerGroup = max(1, Int(Int32.max) / (height * 2 * width * 2 * channel))
+@@ -475,11 +533,12 @@ private func NHWCWanDecoderCausal3D(
+           out = Concat(axis: 0)(
+             stride(from: 0, to: depth, by: framesPerGroup).map { t in
+               let frames = min(framesPerGroup, depth - t)
+-              return conv2d(
++              return applyConv2d(
+                 Upsample(.nearest, widthScale: 2, heightScale: 2)(
+                   input.reshaped(
+                     [frames, height, width, channel], offset: [t, 0, 0, 0],
+-                    strides: [height * width * channel, width * channel, channel, 1])))
++                    strides: [height * width * channel, width * channel, channel, 1])),
++                (frames, height * 2, width * 2, channel))
+             })
+           width *= 2
+           height *= 2
+@@ -489,7 +548,7 @@ private func NHWCWanDecoderCausal3D(
+           ).reshaped([depth, height * 2, width * 2, channel])
+           width *= 2
+           height *= 2
+-          out = conv2d(out)
++          out = applyConv2d(out, (depth, height, width, channel))
+         }
+         if let upShortcut = upShortcut {
+           out = upShortcut + out
+@@ -532,6 +591,8 @@ private func NHWCWanDecoderCausal3D(
+             1, depth + 2, height + 2, width + 2, channels[0],
+           ])
+         )
++      } else if let applyFrameConvOut = applyFrameConvOut {
++        out = applyFrameConvOut(pre, (depth, height, width, channels[0]))
+       } else {
+         out = convOut(pre)
+       }
+@@ -1715,10 +1776,13 @@ private func NCHWWanEncoderCausal3D(
+   return (mapper, Model([x], [out]))
+ }
+ 
+-func WanDecoderCausal3D(
++/// `wrap` (seamless tile) pads the spatial convolutions circularly on the wrapped axes; it needs a
++/// single frame (`startDepth == 1`) and the NHWC format. nil builds today's graph.
++public func WanDecoderCausal3D(
+   channels: [Int], numRepeat: Int, startWidth: Int, startHeight: Int,
+   startDepth: Int, paddingFinalConvLayer: Bool, wan22: Bool, outputChannels: Int,
+-  highPrecisionFinalNorm: Bool, usesFlashAttention: Bool, format: TensorFormat
++  highPrecisionFinalNorm: Bool, usesFlashAttention: Bool, format: TensorFormat,
++  wrap: SeamlessTile? = nil
+ ) -> (ModelWeightMapper, Model) {
+   switch format {
+   case .NHWC:
+@@ -1726,8 +1790,10 @@ func WanDecoderCausal3D(
+       channels: channels, numRepeat: numRepeat, startWidth: startWidth, startHeight: startHeight,
+       startDepth: startDepth, paddingFinalConvLayer: paddingFinalConvLayer, wan22: wan22,
+       outputChannels: outputChannels, highPrecisionFinalNorm: highPrecisionFinalNorm,
+-      usesFlashAttention: usesFlashAttention)
++      usesFlashAttention: usesFlashAttention, wrap: wrap)
+   case .NCHW:
++    // Wrap padding is NHWC only: a seamless decode builds the NHWC decoder.
++    precondition(wrap == nil, "WanDecoderCausal3D: wrap needs the NHWC format")
+     return NCHWWanDecoderCausal3D(
+       channels: channels, numRepeat: numRepeat, startWidth: startWidth, startHeight: startHeight,
+       startDepth: startDepth, paddingFinalConvLayer: paddingFinalConvLayer, wan22: wan22,
+-- 
+2.54.0 (Apple Git-157)
+

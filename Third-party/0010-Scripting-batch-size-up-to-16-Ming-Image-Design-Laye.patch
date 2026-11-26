@@ -1,0 +1,28 @@
+From b1f56dc78c1a5d5c7804956dcbdc10612d4b7d7a Mon Sep 17 00:00:00 2001
+From: Antonio D'Achille <existenz70@gmail.com>
+Date: Thu, 26 Nov 2026 15:42:14 +0100
+Subject: [PATCH 10/10] Scripting: batch size up to 16 (Ming-Image Design-Layer
+ needs layers + 1 frames)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Libraries/Scripting/Sources/ScriptModels.swift | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/Libraries/Scripting/Sources/ScriptModels.swift b/Libraries/Scripting/Sources/ScriptModels.swift
+index 1ed649f..d7ad164 100644
+--- a/Libraries/Scripting/Sources/ScriptModels.swift
++++ b/Libraries/Scripting/Sources/ScriptModels.swift
+@@ -328,7 +328,8 @@ public final class JSGenerationConfiguration: Codable {
+       seed: seed >= 0 ? UInt32(seed) : UInt32.random(in: UInt32.min...UInt32.max), steps: steps,
+       guidanceScale: guidanceScale, strength: strength, model: model,
+       sampler: SamplerType(rawValue: sampler)!, batchCount: max(batchCount, 1),
+-      batchSize: min(max(batchSize, 1), 4),
++      // Up to 16: Ming-Image Design-Layer decomposes into N layers as a batch of N + 1 frames.
++      batchSize: min(max(batchSize, 1), 16),
+       hiresFix: hiresFix, hiresFixStartWidth: UInt16(hiresFixWidth / 64),
+       hiresFixStartHeight: UInt16(hiresFixHeight / 64), hiresFixStrength: hiresFixStrength,
+       upscaler: upscaler, imageGuidanceScale: imageGuidanceScale,
+-- 
+2.54.0 (Apple Git-157)
+

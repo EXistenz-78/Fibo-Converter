@@ -232,6 +232,83 @@ final class ConversionTests: XCTestCase {
   }
 }
 
+extension ConversionTests {
+  // MARK: Ming-Image Design-Layer
+
+  func testMingLayerNeedsDesignFirst() async throws {
+    XCTAssertEqual(MingLayerConversion.missingDesignFiles(in: models).count, 5)
+    let job = MingLayerJob(
+      modelFile: try input("layer.safetensors"), textEncoderFile: try input("layer-encoder.safetensors"),
+      models: models, work: models.appendingPathComponent("_w"), helpers: helpers, precision: .eightBitS)
+    do {
+      try await WorkRunner().run(MingLayerConversion.steps(job), work: job.work) { _ in }
+      XCTFail("expected a failure")
+    } catch {
+      XCTAssertTrue("\(error)".contains("Convert Ming-Image Design first"), "\(error)")
+    }
+  }
+
+  func testMingLayerBuildsTheEncoderFromDesignsAndRegisters() async throws {
+    for file in MingLayerOutputs.designFiles {
+      try Data(file.utf8).write(to: models.appendingPathComponent(file))
+    }
+    _ = try script(
+      "ModelConverter",
+      """
+      c=0; while [ $# -gt 0 ]; do case "$1" in --ming-connector-only) c=1; shift;; -n) n="$2"; shift 2;; -o) o="$2"; shift 2;; -f) f="$2"; shift 2;; *) shift;; esac; done
+      [ -e "$f" ] || { echo "missing input $f"; exit 3; }
+      case "$n" in *_connector) [ $c = 1 ] || { echo "connector without --ming-connector-only"; exit 4; };; esac
+      echo data > "$o/${n}_f16.ckpt"
+      """)
+    _ = try script(
+      "QuantI8x",
+      """
+      while [ $# -gt 0 ]; do case "$1" in -i) i="$2"; shift 2;; -m) m="$2"; shift 2;; -o) o="$2"; shift 2;; *) shift;; esac; done
+      [ -e "$i" ] || { echo "missing input $i"; exit 3; }
+      [ "$m" = "ming_image" ] || { echo "wrong version $m"; exit 5; }
+      echo data > "$o"
+      """)
+    let sqlite = try script("sqlite3", "echo \"$2\" > \"$1.sql\"\n", in: root)
+    let job = MingLayerJob(
+      modelFile: try input("layer.safetensors"), textEncoderFile: try input("layer-encoder.safetensors"),
+      models: models, work: models.appendingPathComponent("_w"), helpers: helpers, precision: .eightBitS,
+      sqlite: sqlite)
+    let events = Events()
+    try await WorkRunner().run(MingLayerConversion.steps(job), work: job.work) { events.add($0) }
+    XCTAssertEqual(
+      events.finished,
+      ["design", "connector", "quantizeConnector", "encoder", "model", "quantize", "register", "cleanup"])
+    let fm = FileManager.default
+    let encoder = models.appendingPathComponent("ming_image_ling_mini_2.0_layer_i8x.ckpt")
+    // A copy of Design's text encoder (and of its tensor data), with the Layer rows put in by sqlite3.
+    XCTAssertEqual(try String(contentsOf: encoder, encoding: .utf8), "ming_image_ling_mini_2.0_i8x.ckpt")
+    XCTAssertEqual(
+      try String(contentsOf: URL(fileURLWithPath: encoder.path + "-tensordata"), encoding: .utf8),
+      "ming_image_ling_mini_2.0_i8x.ckpt-tensordata")
+    let sql = try String(contentsOf: URL(fileURLWithPath: encoder.path + ".sql"), encoding: .utf8)
+    XCTAssertTrue(sql.contains("ming_image_ling_mini_2.0_layer_connector_i8x.ckpt' as layer"), sql)
+    XCTAssertTrue(sql.contains("delete from main.tensors where name in (select name from layer.tensors)"), sql)
+    XCTAssertTrue(fm.fileExists(atPath: models.appendingPathComponent("ming_image_0.1_design_layer_i8x.ckpt").path))
+    XCTAssertFalse(fm.fileExists(atPath: models.appendingPathComponent("ming_image_0.1_design_layer_f16.ckpt").path))
+    let list = try JSONSerialization.jsonObject(with: Data(contentsOf: models.appendingPathComponent("custom.json"))) as! [[String: Any]]
+    let entry = try XCTUnwrap(list.first { $0["file"] as? String == "ming_image_0.1_design_layer_i8x.ckpt" })
+    XCTAssertEqual(entry["name"] as? String, "Ming Image 0.1 Design-Layer (8-bit S)")
+    XCTAssertEqual(entry["text_encoder"] as? String, "ming_image_ling_mini_2.0_layer_i8x.ckpt")
+    XCTAssertEqual(entry["clip_encoder"] as? String, "ming_image_ling_mini_2.0_vision_f16.ckpt")
+    XCTAssertEqual(entry["is_consistency_model"] as? Bool, false)
+    let mmdit = try XCTUnwrap(entry["mmdit"] as? [String: Any])
+    XCTAssertEqual((mmdit["activation_qk_scaling"] as? [String: Int])?["2"], 32)
+    XCTAssertEqual((mmdit["activation_proj_scaling"] as? [String: Int])?["0"], 2)
+  }
+
+  func testMingLayerFilesComeFromComfyOrg() {
+    XCTAssertEqual(
+      MingLayerSources.textEncoder.url.absoluteString,
+      "https://huggingface.co/Comfy-Org/Ming-Image/resolve/main/text_encoders/ming_image_0.1_ling_mini_2.0_layer_bf16.safetensors?download=true")
+    XCTAssertEqual(MingLayerSources.model.size, 12_309_874_192)
+  }
+}
+
 final class PrepFetchTests: XCTestCase {
   func testPrepIsToldNotToFetchUnlessAllowed() async throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent("prep-\(UUID().uuidString)")
@@ -293,5 +370,23 @@ final class MingRealConversionTests: XCTestCase {
       modelFile: model, textEncoderFile: encoder, vaeFile: vae, models: folder,
       work: folder.appendingPathComponent("_ming-work"), helpers: URL(fileURLWithPath: helpers), precision: .eightBitS)
     try await WorkRunner().run(MingConversion.steps(job), work: job.work) { event in print(event) }
+  }
+}
+
+/// The Ming-Image Design-Layer conversion with the real tools and weights. Skipped unless MING_LAYER_REAL_MODEL (the
+/// Layer DiT file), MING_LAYER_REAL_ENCODER (the Layer text encoder, or a file with only the parts that differ),
+/// MING_REAL_HELPERS and MING_LAYER_REAL_MODELS (a folder with Ming-Image Design already converted) are set.
+final class MingLayerRealConversionTests: XCTestCase {
+  func testRealLayerConversion() async throws {
+    let env = ProcessInfo.processInfo.environment
+    guard let model = env["MING_LAYER_REAL_MODEL"], let encoder = env["MING_LAYER_REAL_ENCODER"],
+      let helpers = env["MING_REAL_HELPERS"], let models = env["MING_LAYER_REAL_MODELS"]
+    else { throw XCTSkip("Set MING_LAYER_REAL_MODEL, MING_LAYER_REAL_ENCODER, MING_REAL_HELPERS and MING_LAYER_REAL_MODELS.") }
+    let folder = URL(fileURLWithPath: models)
+    let job = MingLayerJob(
+      modelFile: URL(fileURLWithPath: model), textEncoderFile: URL(fileURLWithPath: encoder), models: folder,
+      work: folder.appendingPathComponent("_ming-layer-work"), helpers: URL(fileURLWithPath: helpers),
+      precision: .eightBitS)
+    try await WorkRunner().run(MingLayerConversion.steps(job), work: job.work) { event in print(event) }
   }
 }

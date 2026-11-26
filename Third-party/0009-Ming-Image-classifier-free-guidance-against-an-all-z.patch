@@ -1,0 +1,152 @@
+From 7f0d43d13637d2cc47495fdb1ab21987fdf929df Mon Sep 17 00:00:00 2001
+From: Antonio D'Achille <existenz70@gmail.com>
+Date: Thu, 26 Nov 2026 15:12:26 +0100
+Subject: [PATCH 09/10] Ming-Image: classifier-free guidance against an
+ all-zero caption, batch-safe captions
+
+Guidance > 1 now runs two branches for Ming-Image (Design-Layer needs it, official 2.0 = scale 3);
+the negative caption is all zero as in the reference pipeline. The fixed encoder takes one caption
+row per branch (Layer) or per image (Design) from the batch-repeated conditions, and the Z-Image CFG
+paths split Ming's side-by-side captions in halves and count offsets before the reference latents.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../Sources/Models/UNetProtocol.swift         | 22 +++++++---
+ .../Sources/Samplers/Sampler.swift            |  7 ++-
+ .../Sources/UNetFixedEncoder.swift            | 43 +++++++++++--------
+ 3 files changed, 48 insertions(+), 24 deletions(-)
+
+diff --git a/Libraries/SwiftDiffusion/Sources/Models/UNetProtocol.swift b/Libraries/SwiftDiffusion/Sources/Models/UNetProtocol.swift
+index 603bb5c..8fbddfc 100644
+--- a/Libraries/SwiftDiffusion/Sources/Models/UNetProtocol.swift
++++ b/Libraries/SwiftDiffusion/Sources/Models/UNetProtocol.swift
+@@ -3804,9 +3804,14 @@ extension UNetFromNNC {
+         // TODO: TeaCache insert here.
+         return
+       }
+-      let count = inputs.count
+-      let roundUpTokenLengthUncond = (tokenLengthUncond + 31) / 32 * 32
+-      let roundUpTokenLengthCond = (tokenLengthCond + 31) / 32 * 32
++      // Ming-Image's reference latents come last: the caption and rotary offsets count before them.
++      let count = inputs.count - (version == .mingImage ? referenceImageCount : 0)
++      // Ming-Image's two captions are the same length (the negative one is all zero), side by side.
++      let mingCaptionLength = version == .mingImage ? inputs[count - 130].shape[1] / 2 : 0
++      let roundUpTokenLengthUncond =
++        version == .mingImage ? mingCaptionLength : (tokenLengthUncond + 31) / 32 * 32
++      let roundUpTokenLengthCond =
++        version == .mingImage ? mingCaptionLength : (tokenLengthCond + 31) / 32 * 32
+       let inputs: [DynamicGraph.AnyTensor] = inputs.enumerated().compactMap {
+         let shape = $0.1.shape
+         switch $0.0 {
+@@ -4970,9 +4975,14 @@ extension UNetFromNNC {
+       let shape = firstInput.shape
+       let etUncond: DynamicGraph.Tensor<FloatType>
+       let etCond: DynamicGraph.Tensor<FloatType>
+-      let roundUpTokenLengthUncond = (tokenLengthUncond + 31) / 32 * 32
+-      let roundUpTokenLengthCond = (tokenLengthCond + 31) / 32 * 32
+-      let count = restInputs.count
++      // Ming-Image's reference latents come last: the caption and rotary offsets count before them.
++      let count = restInputs.count - (version == .mingImage ? referenceImageCount : 0)
++      // Ming-Image's two captions are the same length (the negative one is all zero), side by side.
++      let mingCaptionLength = version == .mingImage ? restInputs[count - 130].shape[1] / 2 : 0
++      let roundUpTokenLengthUncond =
++        version == .mingImage ? mingCaptionLength : (tokenLengthUncond + 31) / 32 * 32
++      let roundUpTokenLengthCond =
++        version == .mingImage ? mingCaptionLength : (tokenLengthCond + 31) / 32 * 32
+       if roundUpTokenLengthCond > roundUpTokenLengthUncond {
+         // This if-clause is useful because we compiled the graph with longest token, so later we don't need to trigger the automatic re-compilation.
+         let xCond = firstInput[
+diff --git a/Libraries/SwiftDiffusion/Sources/Samplers/Sampler.swift b/Libraries/SwiftDiffusion/Sources/Samplers/Sampler.swift
+index 7ea4523..a09df96 100644
+--- a/Libraries/SwiftDiffusion/Sources/Samplers/Sampler.swift
++++ b/Libraries/SwiftDiffusion/Sources/Samplers/Sampler.swift
+@@ -390,10 +390,15 @@ public func isCfgEnabled(
+     // Only Fibo 2.0 Edit Turbo (distilled, no classifier-free guidance) is wired.
+     return false
+   }
+-  guard version != .minimaxH3Image && version != .mingImage else {
++  guard version != .minimaxH3Image else {
+     // MiniMax H3 Image is CFG-distilled: it runs one positive branch per step.
+     return false
+   }
++  guard version != .mingImage else {
++    // Ming-Image Design runs at guidance 1 (one branch); Design-Layer guides against an all-zero
++    // caption (official scale 2.0, this scale 3.0).
++    return (textGuidanceScale - 1).magnitude > 1e-3
++  }
+   guard version != .longcatVideoAvatar1_5 else {
+     // Only the distilled no-CFG path is wired; the triple-guidance base path is not implemented.
+     return false
+diff --git a/Libraries/SwiftDiffusion/Sources/UNetFixedEncoder.swift b/Libraries/SwiftDiffusion/Sources/UNetFixedEncoder.swift
+index 66bcf35..ebc13ec 100644
+--- a/Libraries/SwiftDiffusion/Sources/UNetFixedEncoder.swift
++++ b/Libraries/SwiftDiffusion/Sources/UNetFixedEncoder.swift
+@@ -3066,7 +3066,10 @@ extension UNetFixedEncoder {
+       let isLayer = learnedPadTokens != nil
+       // Layer: one sequence of `frames` target frames per guidance branch.
+       let frames = isLayer ? batchSize : 1
+-      let fixedBatchSize = isLayer ? (isCfgEnabled ? 2 : 1) : batchSize
++      // Captions per guidance branch: one for Layer (its frames share it), one per image otherwise.
++      // The conditions arrive repeated to the batch size, all rows the same prompt.
++      let branchBatchSize = isLayer ? 1 : batchSize
++      let fixedBatchSize = branchBatchSize * (isCfgEnabled ? 2 : 1)
+       let capPadLength = isLayer ? paddedCaptionLength - captionLength : 0
+       let fixedCaptionLength = captionLength + capPadLength
+       var timeEmbeds = graph.variable(.GPU(0), .WC(timesteps.count, 256), of: FloatType.self)
+@@ -3093,20 +3096,22 @@ extension UNetFixedEncoder {
+           from: ZImageRotaryPositionEmbedding(
+             height: 0, width: 0, tokenLength: fixedCaptionLength, imagePaddedLength: 0)
+         ).toGPU(0))
+-      // Layer with guidance: the first row is the all-zero (negative) caption.
+-      var fixedQueries = queries
+-      var fixedDirectTokens = directTokens
+-      if isLayer && isCfgEnabled {
+-        fixedQueries = graph.variable(
+-          .GPU(0), .HWC(2, queryLength, queries.shape[2]), of: FloatType.self)
+-        fixedQueries.full(0)
+-        fixedQueries[1..<2, 0..<queryLength, 0..<queries.shape[2]] =
+-          queries[0..<1, 0..<queryLength, 0..<queries.shape[2]]
+-        fixedDirectTokens = graph.variable(
+-          .GPU(0), .HWC(2, directLength, 3_840), of: FloatType.self)
+-        fixedDirectTokens.full(0)
+-        fixedDirectTokens[1..<2, 0..<directLength, 0..<3_840] =
+-          directTokens[0..<1, 0..<directLength, 0..<3_840]
++      // With guidance the negative captions come first and are all zero, as in the reference
++      // pipeline; the positive ones follow.
++      let negativeRows = isCfgEnabled ? branchBatchSize : 0
++      var fixedQueries = graph.variable(
++        .GPU(0), .HWC(fixedBatchSize, queryLength, queries.shape[2]), of: FloatType.self)
++      var fixedDirectTokens = graph.variable(
++        .GPU(0), .HWC(fixedBatchSize, directLength, 3_840), of: FloatType.self)
++      fixedQueries.full(0)
++      fixedDirectTokens.full(0)
++      for i in 0..<branchBatchSize {
++        let row = min(i, queries.shape[0] - 1)
++        let directRow = min(i, directTokens.shape[0] - 1)
++        fixedQueries[(negativeRows + i)..<(negativeRows + i + 1), 0..<queryLength, 0..<queries.shape[2]] =
++          queries[row..<(row + 1), 0..<queryLength, 0..<queries.shape[2]]
++        fixedDirectTokens[(negativeRows + i)..<(negativeRows + i + 1), 0..<directLength, 0..<3_840] =
++          directTokens[directRow..<(directRow + 1), 0..<directLength, 0..<3_840]
+       }
+       var fixedInputs: [DynamicGraph.AnyTensor] = [fixedQueries, fixedDirectTokens, txtRot, timeEmbeds]
+       if let learnedPadTokens, capPadLength > 0 {
+@@ -3168,10 +3173,14 @@ extension UNetFixedEncoder {
+       }
+       var conditions = unetFixed(inputs: fixedInputs[0], Array(fixedInputs[1...]))
+       weightsCache.attach("\(filePath):[fixed]", from: unetFixed.parameters)
+-      if isLayer && isCfgEnabled {
++      if isCfgEnabled {
+         // As Z-Image: the negative and positive captions side by side on the token axis.
+         let caption = conditions[0].as(of: Float.self)
+-        conditions[0] = caption.reshaped(.HWC(1, 2 * fixedCaptionLength, 3_840))
++        conditions[0] = Functional.concat(
++          axis: 1,
++          caption[0..<branchBatchSize, 0..<fixedCaptionLength, 0..<3_840].copied(),
++          caption[branchBatchSize..<(2 * branchBatchSize), 0..<fixedCaptionLength, 0..<3_840]
++            .copied())
+       }
+       // The image's time position is the padded caption length + 1; the caption's rows count up.
+       // Layer: the target frames come first (time position + 1 each), then the references.
+-- 
+2.54.0 (Apple Git-157)
+

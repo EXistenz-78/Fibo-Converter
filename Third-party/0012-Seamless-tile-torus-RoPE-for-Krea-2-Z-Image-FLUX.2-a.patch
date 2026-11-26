@@ -1,0 +1,813 @@
+From fc37959247ce70cdfcd531a199d0945998c0652f Mon Sep 17 00:00:00 2001
+From: Antonio D'Achille <existenz70@gmail.com>
+Date: Wed, 25 Nov 2026 11:47:33 +0100
+Subject: [PATCH 12/17] Seamless tile: torus RoPE for Krea 2, Z-Image, FLUX.2
+ and FLUX.3 (nil keeps today's tensors)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Apps/SeamlessTileTest/main.swift              | 592 ++++++++++++++++++
+ .../SwiftDiffusion/Sources/Models/Flux2.swift |  17 +-
+ .../SwiftDiffusion/Sources/Models/Flux3.swift |  24 +-
+ .../SwiftDiffusion/Sources/Models/Krea2.swift |  17 +-
+ .../Sources/Models/ZImage.swift               |  17 +-
+ 5 files changed, 654 insertions(+), 13 deletions(-)
+
+diff --git a/Apps/SeamlessTileTest/main.swift b/Apps/SeamlessTileTest/main.swift
+index 68566a6..3fb839d 100644
+--- a/Apps/SeamlessTileTest/main.swift
++++ b/Apps/SeamlessTileTest/main.swift
+@@ -1,5 +1,6 @@
+ import Diffusion
+ import Foundation
++import NNC
+ 
+ func check(_ condition: Bool, _ message: String) {
+   if !condition {
+@@ -62,4 +63,595 @@ check(
+   abs(torusFrequency(omega: omega26, period: 64, minTurns: 0.5) - 3 * 2 * Double.pi / 64) < 1e-12,
+   "2.6 turns snap to 3")
+ 
++// MARK: RoPE on the torus.
++
++let gridH = 8
++let gridW = 12
++let textLen = 7
++
++func sameFloats<T: TensorNumeric & BinaryFloatingPoint>(
++  _ a: Tensor<T>, _ b: Tensor<T>, _ message: String
++) {
++  check(a.shape[0] == b.shape[0] && a.shape[1] == b.shape[1], "\(message): same token count")
++  check(a.shape[2] == b.shape[2] && a.shape[3] == b.shape[3], "\(message): same shape")
++  for t in 0..<a.shape[1] {
++    for h in 0..<a.shape[2] {
++      for c in 0..<a.shape[3] {
++        if a[0, t, h, c] != b[0, t, h, c] {
++          print("FAIL: \(message) differs at token \(t) head \(h) channel \(c)")
++          exit(1)
++        }
++      }
++    }
++  }
++}
++
++/// Layout of one function's output: where the height and width pairs sit and how many leading
++/// tokens are image tokens (laid out as y * gridW + x).
++struct RopeLayout {
++  var name: String
++  var heads: Int
++  var heightPairs: Range<Int>
++  var widthPairs: Range<Int>
++  var imageTokens: Int
++}
++
++func angle(_ t: Tensor<Float>, _ token: Int, _ head: Int, _ pair: Int) -> Double {
++  return atan2(Double(t[0, token, head, pair * 2 + 1]), Double(t[0, token, head, pair * 2]))
++}
++
++/// The step between two neighbours times the period is a whole number of turns.
++func checkPeriodic(
++  _ t: Tensor<Float>, _ layout: RopeLayout, axisIsWidth: Bool
++) {
++  let pairs = axisIsWidth ? layout.widthPairs : layout.heightPairs
++  let period = Double(axisIsWidth ? gridW : gridH)
++  var movingChannels = 0
++  for head in 0..<layout.heads {
++    for pair in pairs {
++      // Several rows (columns) to be sure it is the same for every one of them.
++      for line in 0..<(axisIsWidth ? gridH : gridW) {
++        let t0 = axisIsWidth ? line * gridW : line
++        let t1 = axisIsWidth ? line * gridW + 1 : gridW + line
++        var step = angle(t, t1, head, pair) - angle(t, t0, head, pair)
++        step -= (step / (2 * Double.pi)).rounded() * 2 * Double.pi
++        let total = step * period
++        let turns = (total / (2 * Double.pi)).rounded()
++        check(
++          abs(total - turns * 2 * Double.pi) < 1e-5,
++          "\(layout.name): \(axisIsWidth ? "width" : "height") pair \(pair) is not periodic")
++        if line == 0 && head == 0 && abs(step) > 1e-9 { movingChannels += 1 }
++      }
++    }
++  }
++  check(movingChannels > 0, "\(layout.name): some channel of the axis still turns")
++}
++
++func checkTorus(
++  _ layout: RopeLayout, off: Tensor<Float>, both: Tensor<Float>, widthOnly: Tensor<Float>
++) {
++  check(off.shape[1] == both.shape[1], "\(layout.name): same token count")
++  checkPeriodic(both, layout, axisIsWidth: true)
++  checkPeriodic(both, layout, axisIsWidth: false)
++  // Everything but the height and width channels of the image tokens is the same as without.
++  for t in 0..<off.shape[1] {
++    for h in 0..<off.shape[2] {
++      for c in 0..<off.shape[3] {
++        let pair = c / 2
++        let isAxis =
++          t < layout.imageTokens
++          && (layout.heightPairs.contains(pair) || layout.widthPairs.contains(pair))
++        if !isAxis {
++          check(
++            both[0, t, h, c] == off[0, t, h, c] && widthOnly[0, t, h, c] == off[0, t, h, c],
++            "\(layout.name): token \(t) channel \(c) is unchanged")
++        }
++        // Width only: the height channels are the same as without.
++        if t < layout.imageTokens && layout.heightPairs.contains(pair) {
++          check(
++            widthOnly[0, t, h, c] == off[0, t, h, c],
++            "\(layout.name): width only leaves the height channel \(c) alone")
++        }
++      }
++    }
++  }
++  // The torus really changed something.
++  var changed = false
++  for t in 0..<layout.imageTokens {
++    for c in 0..<off.shape[3] where both[0, t, 0, c] != off[0, t, 0, c] { changed = true }
++  }
++  check(changed, "\(layout.name): the torus changes the image tokens")
++}
++
++let both = SeamlessTile(configurationValue: 3)
++let widthOnly = SeamlessTile(configurationValue: 1)
++let heightOnly = SeamlessTile(configurationValue: 2)
++
++// Krea 2 (Float16 and Float, as the call sites use FloatType).
++for references in [0, 1] {
++  sameFloats(
++    Krea2RotaryPositionEmbedding(
++      textLength: textLen, gridHeight: gridH, gridWidth: gridW, referenceCount: references,
++      of: Float.self, seamless: nil),
++    referenceKrea2Rope(
++      textLength: textLen, gridHeight: gridH, gridWidth: gridW, referenceCount: references,
++      of: Float.self),
++    "Krea 2 nil (Float, \(references) references)")
++  sameFloats(
++    Krea2RotaryPositionEmbedding(
++      textLength: textLen, gridHeight: gridH, gridWidth: gridW, referenceCount: references,
++      of: Float16.self, seamless: nil),
++    referenceKrea2Rope(
++      textLength: textLen, gridHeight: gridH, gridWidth: gridW, referenceCount: references,
++      of: Float16.self),
++    "Krea 2 nil (Float16, \(references) references)")
++}
++do {
++  func krea(_ s: SeamlessTile?, _ references: Int) -> Tensor<Float> {
++    return Krea2RotaryPositionEmbedding(
++      textLength: textLen, gridHeight: gridH, gridWidth: gridW, referenceCount: references,
++      of: Float.self, seamless: s)
++  }
++  let layout = RopeLayout(
++    name: "Krea 2", heads: 1, heightPairs: 16..<40, widthPairs: 40..<64,
++    imageTokens: gridH * gridW)
++  checkTorus(
++    layout, off: krea(nil, 0), both: krea(both, 0), widthOnly: krea(widthOnly, 0))
++  let heightTensor = krea(heightOnly, 0)
++  let offTensor = krea(nil, 0)
++  for t in 0..<(gridH * gridW) {
++    for c in (40 * 2)..<(64 * 2) {
++      check(heightTensor[0, t, 0, c] == offTensor[0, t, 0, c], "Krea 2 height only keeps width")
++    }
++  }
++  // One reference: its tokens carry the same y / x angles as the image tokens.
++  let withReference = krea(both, 1)
++  let imageCount = gridH * gridW
++  for t in 0..<imageCount {
++    for c in (16 * 2)..<(64 * 2) {
++      check(
++        withReference[0, t, 0, c] == withReference[0, t + imageCount, 0, c],
++        "Krea 2 reference token \(t) channel \(c) has the image angles")
++    }
++  }
++  // The frame axis and the text are as without.
++  let withReferenceOff = krea(nil, 1)
++  for t in 0..<withReference.shape[1] {
++    for c in 0..<(16 * 2) {
++      check(withReference[0, t, 0, c] == withReferenceOff[0, t, 0, c], "Krea 2 frame axis")
++    }
++    if t >= 2 * imageCount {
++      for c in 0..<(64 * 2) {
++        check(withReference[0, t, 0, c] == withReferenceOff[0, t, 0, c], "Krea 2 text row")
++      }
++    }
++  }
++}
++
++// Z-Image.
++for references in [0, 1] {
++  sameFloats(
++    ZImageRotaryPositionEmbedding(
++      height: gridH, width: gridW, tokenLength: textLen, imagePaddedLength: 3, heads: 2,
++      referenceFrames: references, seamless: nil),
++    referenceZImageRope(
++      height: gridH, width: gridW, tokenLength: textLen, imagePaddedLength: 3, heads: 2,
++      referenceFrames: references),
++    "Z-Image nil (\(references) reference frames)")
++}
++sameFloats(
++  ZImageRotaryPositionEmbedding(
++    height: 0, width: 0, tokenLength: 32, imagePaddedLength: 0, seamless: nil),
++  referenceZImageRope(height: 0, width: 0, tokenLength: 32, imagePaddedLength: 0),
++  "Z-Image nil (text only)")
++do {
++  func z(_ s: SeamlessTile?) -> Tensor<Float> {
++    return ZImageRotaryPositionEmbedding(
++      height: gridH, width: gridW, tokenLength: textLen, imagePaddedLength: 3, heads: 2,
++      seamless: s)
++  }
++  let layout = RopeLayout(
++    name: "Z-Image", heads: 2, heightPairs: 16..<40, widthPairs: 40..<64,
++    imageTokens: gridH * gridW)
++  checkTorus(layout, off: z(nil), both: z(both), widthOnly: z(widthOnly))
++}
++
++// FLUX.2.
++let flux2References = [(height: 4, width: 6)]
++sameFloats(
++  Flux2RotaryPositionEmbedding(
++    height: gridH, width: gridW, tokenLength: textLen, referenceSizes: flux2References,
++    channels: 128, heads: 2, seamless: nil),
++  referenceFlux2Rope(
++    height: gridH, width: gridW, tokenLength: textLen, referenceSizes: flux2References,
++    channels: 128, heads: 2),
++  "FLUX.2 nil")
++do {
++  func f2(_ s: SeamlessTile?) -> Tensor<Float> {
++    return Flux2RotaryPositionEmbedding(
++      height: gridH, width: gridW, tokenLength: textLen, referenceSizes: flux2References,
++      channels: 128, heads: 2, seamless: s)
++  }
++  let layout = RopeLayout(
++    name: "FLUX.2", heads: 2, heightPairs: 16..<32, widthPairs: 32..<48,
++    imageTokens: gridH * gridW)
++  checkTorus(layout, off: f2(nil), both: f2(both), widthOnly: f2(widthOnly))
++}
++
++// FLUX.3 (positions are y * 0.5 and x * 0.5, so the period is the grid * 0.5).
++sameFloats(
++  Flux3RotaryPositionEmbedding(
++    height: gridH, width: gridW, tokenLength: textLen, referenceSizes: flux2References,
++    channels: 128, heads: 2, seamless: nil),
++  referenceFlux3Rope(
++    height: gridH, width: gridW, tokenLength: textLen, referenceSizes: flux2References,
++    channels: 128, heads: 2),
++  "FLUX.3 nil")
++do {
++  func f3(_ s: SeamlessTile?) -> Tensor<Float> {
++    return Flux3RotaryPositionEmbedding(
++      height: gridH, width: gridW, tokenLength: textLen, referenceSizes: flux2References,
++      channels: 128, heads: 2, seamless: s)
++  }
++  let layout = RopeLayout(
++    name: "FLUX.3", heads: 2, heightPairs: 16..<32, widthPairs: 32..<48,
++    imageTokens: gridH * gridW)
++  checkTorus(layout, off: f3(nil), both: f3(both), widthOnly: f3(widthOnly))
++}
++
+ print("SeamlessTileTest: all passed")
++
++// MARK: Frozen copies of the formulas as they were before the seamless parameter.
++
++func referenceKrea2Rope<FloatType: TensorNumeric & BinaryFloatingPoint>(
++  textLength: Int, gridHeight: Int, gridWidth: Int, referenceCount: Int = 0,
++  of dataType: FloatType.Type = FloatType.self
++) -> Tensor<FloatType> {
++  let ropeTheta: Double = 1_000
++  let imageLength = gridHeight * gridWidth
++  // Layout is [image | references | text]. Each reference has the same grid as the image and sits
++  // at the same (y, x); only its first axis (frame) differs: 0 for the image, i + 1 for reference i.
++  let tokenLength = imageLength * (1 + referenceCount) + textLength
++  var rotary = Tensor<FloatType>(.CPU, .NHWC(1, tokenLength, 1, 128))
++  let dim0 = 32
++  let dim1 = 48
++  let dim2 = 48
++  for frame in 0...referenceCount {
++   for y in 0..<gridHeight {
++    for x in 0..<gridWidth {
++      let i = frame * imageLength + y * gridWidth + x
++      for k in 0..<(dim0 / 2) {
++        let theta = Double(frame) * 1.0 / pow(ropeTheta, Double(k) * 2 / Double(dim0))
++        let sintheta = sin(theta)
++        let costheta = cos(theta)
++        rotary[0, i, 0, k * 2] = FloatType(costheta)
++        rotary[0, i, 0, k * 2 + 1] = FloatType(sintheta)
++      }
++      for k in 0..<(dim1 / 2) {
++        let theta = Double(y) * 1.0 / pow(ropeTheta, Double(k) * 2 / Double(dim1))
++        let sintheta = sin(theta)
++        let costheta = cos(theta)
++        rotary[0, i, 0, (k + (dim0 / 2)) * 2] = FloatType(costheta)
++        rotary[0, i, 0, (k + (dim0 / 2)) * 2 + 1] = FloatType(sintheta)
++      }
++      for k in 0..<(dim2 / 2) {
++        let theta = Double(x) * 1.0 / pow(ropeTheta, Double(k) * 2 / Double(dim2))
++        let sintheta = sin(theta)
++        let costheta = cos(theta)
++        rotary[0, i, 0, (k + (dim0 / 2) + (dim1 / 2)) * 2] = FloatType(costheta)
++        rotary[0, i, 0, (k + (dim0 / 2) + (dim1 / 2)) * 2 + 1] = FloatType(sintheta)
++      }
++    }
++   }
++  }
++  let tokenOffset = imageLength * (1 + referenceCount)
++  for i in 0..<textLength {
++    for k in 0..<(dim0 / 2) {
++      let theta = 0 * 1.0 / pow(ropeTheta, Double(k) * 2 / Double(dim0))
++      let sintheta = sin(theta)
++      let costheta = cos(theta)
++      rotary[0, i + tokenOffset, 0, k * 2] = FloatType(costheta)
++      rotary[0, i + tokenOffset, 0, k * 2 + 1] = FloatType(sintheta)
++    }
++    for k in 0..<(dim1 / 2) {
++      let theta = 0 * 1.0 / pow(ropeTheta, Double(k) * 2 / Double(dim1))
++      let sintheta = sin(theta)
++      let costheta = cos(theta)
++      rotary[0, i + tokenOffset, 0, (k + (dim0 / 2)) * 2] = FloatType(costheta)
++      rotary[0, i + tokenOffset, 0, (k + (dim0 / 2)) * 2 + 1] = FloatType(sintheta)
++    }
++    for k in 0..<(dim2 / 2) {
++      let theta = 0 * 1.0 / pow(ropeTheta, Double(k) * 2 / Double(dim2))
++      let sintheta = sin(theta)
++      let costheta = cos(theta)
++      rotary[0, i + tokenOffset, 0, (k + (dim0 / 2) + (dim1 / 2)) * 2] = FloatType(costheta)
++      rotary[0, i + tokenOffset, 0, (k + (dim0 / 2) + (dim1 / 2)) * 2 + 1] =
++        FloatType(sintheta)
++    }
++  }
++  return rotary
++}
++
++func referenceZImageRope(
++  height: Int, width: Int, tokenLength: Int, imagePaddedLength: Int, heads: Int = 1,
++  imageTimePosition: Int? = nil, referenceFrames: Int = 0
++) -> Tensor<Float> {
++  // The image's frame comes first, then one frame per reference (Ming-Image): the same (y, x), a
++  // time position one further for each.
++  var rotTensor = Tensor<Float>(
++    .CPU, .NHWC(1, height * width * (1 + referenceFrames) + imagePaddedLength + tokenLength, heads, 128))
++  let dim0 = 32
++  let dim1 = 48
++  let dim2 = 48
++  for frame in 0...referenceFrames {
++    for y in 0..<height {
++      for x in 0..<width {
++        let i = frame * height * width + y * width + x
++        for j in 0..<heads {
++          for k in 0..<(dim0 / 2) {
++            let theta =
++              Double((imageTimePosition ?? tokenLength) + 1 + frame) * 1.0
++              / pow(256, Double(k) * 2 / Double(dim0))
++          let sintheta = sin(theta)
++          let costheta = cos(theta)
++          rotTensor[0, i, j, k * 2] = Float(costheta)
++          rotTensor[0, i, j, k * 2 + 1] = Float(sintheta)
++        }
++        for k in 0..<(dim1 / 2) {
++          let theta =
++            Double(y) * 1.0 / pow(256, Double(k) * 2 / Double(dim1))
++          let sintheta = sin(theta)
++          let costheta = cos(theta)
++          rotTensor[0, i, j, (k + (dim0 / 2)) * 2] = Float(costheta)
++          rotTensor[0, i, j, (k + (dim0 / 2)) * 2 + 1] = Float(sintheta)
++        }
++        for k in 0..<(dim2 / 2) {
++          let theta =
++            Double(x) * 1.0 / pow(256, Double(k) * 2 / Double(dim2))
++          let sintheta = sin(theta)
++          let costheta = cos(theta)
++          rotTensor[0, i, j, (k + (dim0 / 2) + (dim1 / 2)) * 2] = Float(costheta)
++          rotTensor[0, i, j, (k + (dim0 / 2) + (dim1 / 2)) * 2 + 1] = Float(sintheta)
++        }
++      }
++      }
++    }
++  }
++  let imageTokenCount = height * width * (1 + referenceFrames)
++  if imagePaddedLength > 0 {
++    for i in imageTokenCount..<(imageTokenCount + imagePaddedLength) {
++      for j in 0..<heads {
++        for k in 0..<(dim0 / 2) {
++          let theta = Double(0) * 1.0 / pow(256, Double(k) * 2 / Double(dim0))
++          let sintheta = sin(theta)
++          let costheta = cos(theta)
++          rotTensor[0, i, j, k * 2] = Float(costheta)
++          rotTensor[0, i, j, k * 2 + 1] = Float(sintheta)
++        }
++        for k in 0..<(dim1 / 2) {
++          let theta =
++            Double(0) * 1.0 / pow(256, Double(k) * 2 / Double(dim1))
++          let sintheta = sin(theta)
++          let costheta = cos(theta)
++          rotTensor[0, i, j, (k + (dim0 / 2)) * 2] = Float(costheta)
++          rotTensor[0, i, j, (k + (dim0 / 2)) * 2 + 1] = Float(sintheta)
++        }
++        for k in 0..<(dim2 / 2) {
++          let theta =
++            Double(0) * 1.0 / pow(256, Double(k) * 2 / Double(dim2))
++          let sintheta = sin(theta)
++          let costheta = cos(theta)
++          rotTensor[0, i, j, (k + (dim0 / 2) + (dim1 / 2)) * 2] = Float(costheta)
++          rotTensor[0, i, j, (k + (dim0 / 2) + (dim1 / 2)) * 2 + 1] = Float(sintheta)
++        }
++      }
++    }
++  }
++  let offset = imageTokenCount + imagePaddedLength
++  for i in 0..<tokenLength {
++    for j in 0..<heads {
++      for k in 0..<(dim0 / 2) {
++        let theta = Double(i + 1) * 1.0 / pow(256, Double(k) * 2 / Double(dim0))
++        let sintheta = sin(theta)
++        let costheta = cos(theta)
++        rotTensor[0, offset + i, j, k * 2] = Float(costheta)
++        rotTensor[0, offset + i, j, k * 2 + 1] = Float(sintheta)
++      }
++      for k in 0..<(dim1 / 2) {
++        let theta = Double(0) * 1.0 / pow(256, Double(k) * 2 / Double(dim1))
++        let sintheta = sin(theta)
++        let costheta = cos(theta)
++        rotTensor[0, offset + i, j, (k + (dim0 / 2)) * 2] = Float(costheta)
++        rotTensor[0, offset + i, j, (k + (dim0 / 2)) * 2 + 1] = Float(sintheta)
++      }
++      for k in 0..<(dim2 / 2) {
++        let theta = Double(0) * 1.0 / pow(256, Double(k) * 2 / Double(dim2))
++        let sintheta = sin(theta)
++        let costheta = cos(theta)
++        rotTensor[0, offset + i, j, (k + (dim0 / 2) + (dim1 / 2)) * 2] = Float(costheta)
++        rotTensor[0, offset + i, j, (k + (dim0 / 2) + (dim1 / 2)) * 2 + 1] = Float(sintheta)
++      }
++    }
++  }
++  return rotTensor
++}
++
++func referenceFlux2Rope(
++  height: Int, width: Int, tokenLength: Int, referenceSizes: [(height: Int, width: Int)],
++  channels: Int, heads: Int = 1
++)
++  -> Tensor<Float>
++{
++  var rotTensor = Tensor<Float>(
++    .CPU,
++    .NHWC(
++      1, height * width + tokenLength + referenceSizes.reduce(0) { $0 + $1.height * $1.width },
++      heads, channels))
++  let dim0 = channels / 4
++  let dim1 = dim0
++  let dim2 = dim1
++  let dim3 = dim2
++  assert(channels % 16 == 0)
++  for y in 0..<height {
++    for x in 0..<width {
++      let i = y * width + x
++      for j in 0..<heads {
++        for k in 0..<(dim0 / 2) {
++          let theta = 0 * 1.0 / pow(2_000, Double(k) * 2 / Double(dim0))
++          let sintheta = sin(theta)
++          let costheta = cos(theta)
++          rotTensor[0, i, j, k * 2] = Float(costheta)
++          rotTensor[0, i, j, k * 2 + 1] = Float(sintheta)
++        }
++        for k in 0..<(dim1 / 2) {
++          let theta = Double(y) * 1.0 / pow(2_000, Double(k) * 2 / Double(dim1))
++          let sintheta = sin(theta)
++          let costheta = cos(theta)
++          rotTensor[0, i, j, (k + (dim0 / 2)) * 2] = Float(costheta)
++          rotTensor[0, i, j, (k + (dim0 / 2)) * 2 + 1] = Float(sintheta)
++        }
++        for k in 0..<(dim2 / 2) {
++          let theta = Double(x) * 1.0 / pow(2_000, Double(k) * 2 / Double(dim2))
++          let sintheta = sin(theta)
++          let costheta = cos(theta)
++          rotTensor[0, i, j, (k + (dim0 / 2) + (dim1 / 2)) * 2] = Float(costheta)
++          rotTensor[0, i, j, (k + (dim0 / 2) + (dim1 / 2)) * 2 + 1] = Float(sintheta)
++        }
++        for k in 0..<(dim3 / 2) {
++          let theta = 0 * 1.0 / pow(2_000, Double(k) * 2 / Double(dim3))
++          let sintheta = sin(theta)
++          let costheta = cos(theta)
++          rotTensor[0, i, j, (k + (dim0 / 2) + (dim1 / 2) + (dim2 / 2)) * 2] = Float(costheta)
++          rotTensor[0, i, j, (k + (dim0 / 2) + (dim1 / 2) + (dim2 / 2)) * 2 + 1] = Float(sintheta)
++        }
++      }
++    }
++  }
++  var index = width * height
++  for (n, referenceSize) in referenceSizes.enumerated() {
++    let height = referenceSize.height
++    let width = referenceSize.width
++    for y in 0..<height {
++      for x in 0..<width {
++        let i = y * width + x + index
++        for j in 0..<heads {
++          for k in 0..<(dim0 / 2) {
++            let theta = Double(10 + n * 10) * 1.0 / pow(2_000, Double(k) * 2 / Double(dim0))
++            let sintheta = sin(theta)
++            let costheta = cos(theta)
++            rotTensor[0, i, j, k * 2] = Float(costheta)
++            rotTensor[0, i, j, k * 2 + 1] = Float(sintheta)
++          }
++          for k in 0..<(dim1 / 2) {
++            let theta = Double(y) * 1.0 / pow(2_000, Double(k) * 2 / Double(dim1))
++            let sintheta = sin(theta)
++            let costheta = cos(theta)
++            rotTensor[0, i, j, (k + (dim0 / 2)) * 2] = Float(costheta)
++            rotTensor[0, i, j, (k + (dim0 / 2)) * 2 + 1] = Float(sintheta)
++          }
++          for k in 0..<(dim2 / 2) {
++            let theta = Double(x) * 1.0 / pow(2_000, Double(k) * 2 / Double(dim2))
++            let sintheta = sin(theta)
++            let costheta = cos(theta)
++            rotTensor[0, i, j, (k + (dim0 / 2) + (dim1 / 2)) * 2] = Float(costheta)
++            rotTensor[0, i, j, (k + (dim0 / 2) + (dim1 / 2)) * 2 + 1] = Float(sintheta)
++          }
++          for k in 0..<(dim3 / 2) {
++            let theta = 0 * 1.0 / pow(2_000, Double(k) * 2 / Double(dim3))
++            let sintheta = sin(theta)
++            let costheta = cos(theta)
++            rotTensor[0, i, j, (k + (dim0 / 2) + (dim1 / 2) + (dim2 / 2)) * 2] = Float(costheta)
++            rotTensor[0, i, j, (k + (dim0 / 2) + (dim1 / 2) + (dim2 / 2)) * 2 + 1] = Float(sintheta)
++          }
++        }
++      }
++    }
++    index += height * width
++  }
++  let tokenOffset = index
++  for i in 0..<tokenLength {
++    for j in 0..<heads {
++      for k in 0..<(dim0 / 2) {
++        let theta = 0 * 1.0 / pow(2_000, Double(k) * 2 / Double(dim0))
++        let sintheta = sin(theta)
++        let costheta = cos(theta)
++        rotTensor[0, i + tokenOffset, j, k * 2] = Float(costheta)
++        rotTensor[0, i + tokenOffset, j, k * 2 + 1] = Float(sintheta)
++      }
++      for k in 0..<(dim1 / 2) {
++        let theta = 0 * 1.0 / pow(2_000, Double(k) * 2 / Double(dim1))
++        let sintheta = sin(theta)
++        let costheta = cos(theta)
++        rotTensor[0, i + tokenOffset, j, (k + (dim0 / 2)) * 2] = Float(costheta)
++        rotTensor[0, i + tokenOffset, j, (k + (dim0 / 2)) * 2 + 1] = Float(sintheta)
++      }
++      for k in 0..<(dim2 / 2) {
++        let theta = 0 * 1.0 / pow(2_000, Double(k) * 2 / Double(dim2))
++        let sintheta = sin(theta)
++        let costheta = cos(theta)
++        rotTensor[0, i + tokenOffset, j, (k + (dim0 / 2) + (dim1 / 2)) * 2] = Float(costheta)
++        rotTensor[0, i + tokenOffset, j, (k + (dim0 / 2) + (dim1 / 2)) * 2 + 1] = Float(sintheta)
++      }
++      for k in 0..<(dim3 / 2) {
++        let theta = Double(i) * 1.0 / pow(2_000, Double(k) * 2 / Double(dim3))
++        let sintheta = sin(theta)
++        let costheta = cos(theta)
++        rotTensor[0, i + tokenOffset, j, (k + (dim0 / 2) + (dim1 / 2) + (dim2 / 2)) * 2] = Float(
++          costheta)
++        rotTensor[0, i + tokenOffset, j, (k + (dim0 / 2) + (dim1 / 2) + (dim2 / 2)) * 2 + 1] =
++          Float(sintheta)
++      }
++    }
++  }
++  return rotTensor
++}
++
++func referenceFlux3Rope(
++  height: Int, width: Int, tokenLength: Int, referenceSizes: [(height: Int, width: Int)],
++  channels: Int, heads: Int = 1
++)
++  -> Tensor<Float>
++{
++  var rotTensor = Tensor<Float>(
++    .CPU,
++    .NHWC(
++      1, height * width + referenceSizes.reduce(0) { $0 + $1.height * $1.width } + tokenLength,
++      heads, channels))
++  let dim = channels / 4
++  assert(channels % 16 == 0)
++  // Each token has 4 position axes (unused, y, x, text / reference index), each takes channels / 4.
++  func setPositions(_ i: Int, _ positions: [Double]) {
++    for j in 0..<heads {
++      for (axis, position) in positions.enumerated() {
++        for k in 0..<(dim / 2) {
++          let theta = position * 1.0 / pow(10_000, Double(k) * 2 / Double(dim))
++          let sintheta = sin(theta)
++          let costheta = cos(theta)
++          rotTensor[0, i, j, (k + axis * (dim / 2)) * 2] = Float(costheta)
++          rotTensor[0, i, j, (k + axis * (dim / 2)) * 2 + 1] = Float(sintheta)
++        }
++      }
++    }
++  }
++  for y in 0..<height {
++    for x in 0..<width {
++      setPositions(y * width + x, [0, Double(y) * 0.5, Double(x) * 0.5, 0])
++    }
++  }
++  var index = height * width
++  for (n, referenceSize) in referenceSizes.enumerated() {
++    let height = referenceSize.height
++    let width = referenceSize.width
++    for y in 0..<height {
++      for x in 0..<width {
++        setPositions(
++          y * width + x + index, [0, Double(y) * 0.5, Double(x) * 0.5, Double(-1 - n)])
++      }
++    }
++    index += height * width
++  }
++  for i in 0..<tokenLength {
++    setPositions(i + index, [0, 0, 0, Double(i)])
++  }
++  return rotTensor
++}
+diff --git a/Libraries/SwiftDiffusion/Sources/Models/Flux2.swift b/Libraries/SwiftDiffusion/Sources/Models/Flux2.swift
+index 190f639..ee1bff9 100644
+--- a/Libraries/SwiftDiffusion/Sources/Models/Flux2.swift
++++ b/Libraries/SwiftDiffusion/Sources/Models/Flux2.swift
+@@ -4,10 +4,11 @@ import NNC
+ 
+ public func Flux2RotaryPositionEmbedding(
+   height: Int, width: Int, tokenLength: Int, referenceSizes: [(height: Int, width: Int)],
+-  channels: Int, heads: Int = 1
++  channels: Int, heads: Int = 1, seamless: SeamlessTile? = nil
+ )
+   -> Tensor<Float>
+ {
++  let seamlessMinTurns = 0.5
+   var rotTensor = Tensor<Float>(
+     .CPU,
+     .NHWC(
+@@ -30,14 +31,24 @@ public func Flux2RotaryPositionEmbedding(
+           rotTensor[0, i, j, k * 2 + 1] = Float(sintheta)
+         }
+         for k in 0..<(dim1 / 2) {
+-          let theta = Double(y) * 1.0 / pow(2_000, Double(k) * 2 / Double(dim1))
++          var theta = Double(y) * 1.0 / pow(2_000, Double(k) * 2 / Double(dim1))
++          if let seamless = seamless, seamless.wrapsHeight {
++            theta = torusAngle(
++              position: Double(y), omega: 1.0 / pow(2_000, Double(k) * 2 / Double(dim1)),
++              period: Double(height), minTurns: seamlessMinTurns)
++          }
+           let sintheta = sin(theta)
+           let costheta = cos(theta)
+           rotTensor[0, i, j, (k + (dim0 / 2)) * 2] = Float(costheta)
+           rotTensor[0, i, j, (k + (dim0 / 2)) * 2 + 1] = Float(sintheta)
+         }
+         for k in 0..<(dim2 / 2) {
+-          let theta = Double(x) * 1.0 / pow(2_000, Double(k) * 2 / Double(dim2))
++          var theta = Double(x) * 1.0 / pow(2_000, Double(k) * 2 / Double(dim2))
++          if let seamless = seamless, seamless.wrapsWidth {
++            theta = torusAngle(
++              position: Double(x), omega: 1.0 / pow(2_000, Double(k) * 2 / Double(dim2)),
++              period: Double(width), minTurns: seamlessMinTurns)
++          }
+           let sintheta = sin(theta)
+           let costheta = cos(theta)
+           rotTensor[0, i, j, (k + (dim0 / 2) + (dim1 / 2)) * 2] = Float(costheta)
+diff --git a/Libraries/SwiftDiffusion/Sources/Models/Flux3.swift b/Libraries/SwiftDiffusion/Sources/Models/Flux3.swift
+index 43fe271..8db2db9 100644
+--- a/Libraries/SwiftDiffusion/Sources/Models/Flux3.swift
++++ b/Libraries/SwiftDiffusion/Sources/Models/Flux3.swift
+@@ -4,10 +4,11 @@ import NNC
+ 
+ public func Flux3RotaryPositionEmbedding(
+   height: Int, width: Int, tokenLength: Int, referenceSizes: [(height: Int, width: Int)],
+-  channels: Int, heads: Int = 1
++  channels: Int, heads: Int = 1, seamless: SeamlessTile? = nil
+ )
+   -> Tensor<Float>
+ {
++  let seamlessMinTurns = 0.5
+   var rotTensor = Tensor<Float>(
+     .CPU,
+     .NHWC(
+@@ -16,11 +17,17 @@ public func Flux3RotaryPositionEmbedding(
+   let dim = channels / 4
+   assert(channels % 16 == 0)
+   // Each token has 4 position axes (unused, y, x, text / reference index), each takes channels / 4.
+-  func setPositions(_ i: Int, _ positions: [Double]) {
++  // `periods` holds the tile period (in position units) of the axes that wrap, 0 for the others.
++  func setPositions(_ i: Int, _ positions: [Double], periods: [Double] = []) {
+     for j in 0..<heads {
+       for (axis, position) in positions.enumerated() {
+         for k in 0..<(dim / 2) {
+-          let theta = position * 1.0 / pow(10_000, Double(k) * 2 / Double(dim))
++          var theta = position * 1.0 / pow(10_000, Double(k) * 2 / Double(dim))
++          if axis < periods.count, periods[axis] > 0 {
++            theta = torusAngle(
++              position: position, omega: 1.0 / pow(10_000, Double(k) * 2 / Double(dim)),
++              period: periods[axis], minTurns: seamlessMinTurns)
++          }
+           let sintheta = sin(theta)
+           let costheta = cos(theta)
+           rotTensor[0, i, j, (k + axis * (dim / 2)) * 2] = Float(costheta)
+@@ -29,9 +36,18 @@ public func Flux3RotaryPositionEmbedding(
+       }
+     }
+   }
++  // The positions are the grid * 0.5, so a tile is grid * 0.5 long.
++  var imagePeriods: [Double] = []
++  if let seamless = seamless {
++    imagePeriods = [
++      0, seamless.wrapsHeight ? Double(height) * 0.5 : 0,
++      seamless.wrapsWidth ? Double(width) * 0.5 : 0, 0,
++    ]
++  }
+   for y in 0..<height {
+     for x in 0..<width {
+-      setPositions(y * width + x, [0, Double(y) * 0.5, Double(x) * 0.5, 0])
++      setPositions(
++        y * width + x, [0, Double(y) * 0.5, Double(x) * 0.5, 0], periods: imagePeriods)
+     }
+   }
+   var index = height * width
+diff --git a/Libraries/SwiftDiffusion/Sources/Models/Krea2.swift b/Libraries/SwiftDiffusion/Sources/Models/Krea2.swift
+index 3b5d677..f362731 100644
+--- a/Libraries/SwiftDiffusion/Sources/Models/Krea2.swift
++++ b/Libraries/SwiftDiffusion/Sources/Models/Krea2.swift
+@@ -3,9 +3,10 @@ import NNC
+ 
+ public func Krea2RotaryPositionEmbedding<FloatType: TensorNumeric & BinaryFloatingPoint>(
+   textLength: Int, gridHeight: Int, gridWidth: Int, referenceCount: Int = 0,
+-  of dataType: FloatType.Type = FloatType.self
++  of dataType: FloatType.Type = FloatType.self, seamless: SeamlessTile? = nil
+ ) -> Tensor<FloatType> {
+   let ropeTheta: Double = 1_000
++  let seamlessMinTurns = 0.5
+   let imageLength = gridHeight * gridWidth
+   // Layout is [image | references | text]. Each reference has the same grid as the image and sits
+   // at the same (y, x); only its first axis (frame) differs: 0 for the image, i + 1 for reference i.
+@@ -26,14 +27,24 @@ public func Krea2RotaryPositionEmbedding<FloatType: TensorNumeric & BinaryFloati
+         rotary[0, i, 0, k * 2 + 1] = FloatType(sintheta)
+       }
+       for k in 0..<(dim1 / 2) {
+-        let theta = Double(y) * 1.0 / pow(ropeTheta, Double(k) * 2 / Double(dim1))
++        var theta = Double(y) * 1.0 / pow(ropeTheta, Double(k) * 2 / Double(dim1))
++        if let seamless = seamless, seamless.wrapsHeight {
++          theta = torusAngle(
++            position: Double(y), omega: 1.0 / pow(ropeTheta, Double(k) * 2 / Double(dim1)),
++            period: Double(gridHeight), minTurns: seamlessMinTurns)
++        }
+         let sintheta = sin(theta)
+         let costheta = cos(theta)
+         rotary[0, i, 0, (k + (dim0 / 2)) * 2] = FloatType(costheta)
+         rotary[0, i, 0, (k + (dim0 / 2)) * 2 + 1] = FloatType(sintheta)
+       }
+       for k in 0..<(dim2 / 2) {
+-        let theta = Double(x) * 1.0 / pow(ropeTheta, Double(k) * 2 / Double(dim2))
++        var theta = Double(x) * 1.0 / pow(ropeTheta, Double(k) * 2 / Double(dim2))
++        if let seamless = seamless, seamless.wrapsWidth {
++          theta = torusAngle(
++            position: Double(x), omega: 1.0 / pow(ropeTheta, Double(k) * 2 / Double(dim2)),
++            period: Double(gridWidth), minTurns: seamlessMinTurns)
++        }
+         let sintheta = sin(theta)
+         let costheta = cos(theta)
+         rotary[0, i, 0, (k + (dim0 / 2) + (dim1 / 2)) * 2] = FloatType(costheta)
+diff --git a/Libraries/SwiftDiffusion/Sources/Models/ZImage.swift b/Libraries/SwiftDiffusion/Sources/Models/ZImage.swift
+index 2d73b95..65470ce 100644
+--- a/Libraries/SwiftDiffusion/Sources/Models/ZImage.swift
++++ b/Libraries/SwiftDiffusion/Sources/Models/ZImage.swift
+@@ -4,8 +4,9 @@ import NNC
+ 
+ public func ZImageRotaryPositionEmbedding(
+   height: Int, width: Int, tokenLength: Int, imagePaddedLength: Int, heads: Int = 1,
+-  imageTimePosition: Int? = nil, referenceFrames: Int = 0
++  imageTimePosition: Int? = nil, referenceFrames: Int = 0, seamless: SeamlessTile? = nil
+ ) -> Tensor<Float> {
++  let seamlessMinTurns = 1.0
+   // The image's frame comes first, then one frame per reference (Ming-Image): the same (y, x), a
+   // time position one further for each.
+   var rotTensor = Tensor<Float>(
+@@ -28,16 +29,26 @@ public func ZImageRotaryPositionEmbedding(
+           rotTensor[0, i, j, k * 2 + 1] = Float(sintheta)
+         }
+         for k in 0..<(dim1 / 2) {
+-          let theta =
++          var theta =
+             Double(y) * 1.0 / pow(256, Double(k) * 2 / Double(dim1))
++          if let seamless = seamless, seamless.wrapsHeight {
++            theta = torusAngle(
++              position: Double(y), omega: 1.0 / pow(256, Double(k) * 2 / Double(dim1)),
++              period: Double(height), minTurns: seamlessMinTurns)
++          }
+           let sintheta = sin(theta)
+           let costheta = cos(theta)
+           rotTensor[0, i, j, (k + (dim0 / 2)) * 2] = Float(costheta)
+           rotTensor[0, i, j, (k + (dim0 / 2)) * 2 + 1] = Float(sintheta)
+         }
+         for k in 0..<(dim2 / 2) {
+-          let theta =
++          var theta =
+             Double(x) * 1.0 / pow(256, Double(k) * 2 / Double(dim2))
++          if let seamless = seamless, seamless.wrapsWidth {
++            theta = torusAngle(
++              position: Double(x), omega: 1.0 / pow(256, Double(k) * 2 / Double(dim2)),
++              period: Double(width), minTurns: seamlessMinTurns)
++          }
+           let sintheta = sin(theta)
+           let costheta = cos(theta)
+           rotTensor[0, i, j, (k + (dim0 / 2) + (dim1 / 2)) * 2] = Float(costheta)
+-- 
+2.54.0 (Apple Git-157)
+

@@ -19,6 +19,13 @@ registers them in the models folder's `custom.json`:
   turning black. Ming-Image runs only on the Draw Things engine fork's server (DT Hub 1.8.3+ includes it); Z-Image LoRAs work on it.
   Needs about 55 GB free while it runs (26 GB at the end).
 
+- **Ming Layer** (new in 1.4): converts [Ming-Image 0.1 Design-Layer](https://huggingface.co/inclusionAI/Ming-Image-0.1-Design-Layer)
+  (inclusionAI, MIT), which splits a finished design into transparent layers. Convert Ming-Image Design first: the Layer
+  model uses its vision tower, VAE and tokenizer, and its text encoder is built from Design's, taking only the parts that
+  differ from the Layer file (connector, projections, query tokens; on APFS the shared 18 GB are a clone). Download the two
+  Layer files of Comfy-Org/Ming-Image (about 49 GB); the result adds about 8 GB. It runs on the server of DT Hub 1.10.0+:
+  the design as the start image, batch size = layers + 1, guidance 3.
+
 The Any-safetensors and MiniMax H3 tabs are new in 1.1 and have only been tested with stand-in tools, not on real weights.
 
 **Licence.** Fibo 2.0 is CC BY-NC 4.0 (non-commercial, credit to Bria). The app contains and downloads no weights: you log in
@@ -39,8 +46,8 @@ With 8-bit S only, the full-precision intermediates are moved to the Trash. `cus
 Scripts/build-app.sh      # writes build/Model Converter.app
 swift test                # merge, custom.json and pipeline (with stand-in tools)
 ```
-The conversion tools are built from the Draw Things fork checkout (`FORK`, default `~/Developer-krea2/fork-f4d03b02`, branch
-`ming-image`: SwiftPM targets `ModelConverter` and `QuantI8x`, an i8x variant of the fork's `ModelQuantizer` that also knows
+The conversion tools are built from the Draw Things fork checkout (`FORK`, default `~/Software developement/DT Hub/Developer-krea2/fork-ming-layer`, branch
+`dthub-engine`: SwiftPM targets `ModelConverter` and `QuantI8x`, an i8x variant of the fork's `ModelQuantizer` that also knows
 the MiniMax H3 Image and Ming-Image rules). The patches are in `Third-party/`. The tools are copied into the app (`Contents/Helpers`).
 
 ## Credits and third-party tools

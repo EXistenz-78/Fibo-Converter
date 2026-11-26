@@ -1,0 +1,1080 @@
+From 7614eedf793109b668ae26cdcca71a4128189d67 Mon Sep 17 00:00:00 2001
+From: Antonio D'Achille <existenz70@gmail.com>
+Date: Wed, 25 Nov 2026 16:27:00 +0100
+Subject: [PATCH 16/17] Seamless tile: LocalImageGenerator reads seamlessTile
+ for the four families; whole decode, no tiled diffusion
+
+- LocalImageGenerator.generate reads GenerationConfiguration.seamlessTile only for Krea 2, Z-Image,
+  FLUX.2 and FLUX.3 and runs on a copy that carries it, with tiled diffusion and tiled decoding off;
+  a size that is not a multiple of 16 px is refused with an error.
+- Every sampler gets `seamless` (Sampler protocol) and passes it to its UNetFixedEncoder, base and
+  refiner; the RoPE is built per pass, so a HiRes fix pass uses its own grid.
+- FirstStage.wrap: the Z-Image, FLUX.2/3 and Krea 2 decoders are built NHWC with the wrap, at the
+  whole latent size (no tiles, no forced Wan tiling, no cached decoder); ModelPreloader keys its
+  cached decoder on the wrap.
+- JSGenerationConfiguration.seamlessTile (absent when 0) so draw-things-cli --config-json reaches it.
+- Krea 2 min_turns 0.5 -> 1.0: at 0.5 the DT Krea 2 turbo repeated the tile twice inside the tile
+  (stone texture, autocorrelation 0.90 at half the tile; 0.19 at 1.0, no fault lines on planks).
+- Apps/SeamlessTileTest/e2e.sh (generate + ComfyUI seam_check) and baseline.sha256 (bcdc18f, flag off):
+  all four families PASS both directions; flag-off output byte-identical; Ming ignores the flag.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Apps/SeamlessTileTest/baseline.sha256         |   4 +
+ Apps/SeamlessTileTest/e2e.sh                  | 109 ++++++++++++++++++
+ Apps/SeamlessTileTest/main.swift              |   2 +-
+ .../Sources/LocalImageGenerator.swift         |  77 +++++++++++--
+ .../Sources/ModelPreloader.swift              |   8 +-
+ .../Scripting/Sources/ScriptModels.swift      |   7 +-
+ .../SwiftDiffusion/Sources/FirstStage.swift   |  26 +++--
+ .../SwiftDiffusion/Sources/Models/Krea2.swift |   2 +-
+ .../Samplers/ComfyMultistepSampler.swift      |   8 +-
+ .../Sources/Samplers/DDIMSampler.swift        |   8 +-
+ .../Sources/Samplers/DPMPP2MSampler.swift     |   8 +-
+ .../Sources/Samplers/DPMPPSDESampler.swift    |   8 +-
+ .../Sources/Samplers/EulerASampler.swift      |   8 +-
+ .../Sources/Samplers/LCMSampler.swift         |   8 +-
+ .../Sources/Samplers/PLMSSampler.swift        |   8 +-
+ .../Sources/Samplers/Sampler.swift            |   2 +
+ .../Sources/Samplers/TCDSampler.swift         |   8 +-
+ .../Sources/Samplers/UniPCSampler.swift       |   8 +-
+ .../SwiftDiffusion/Sources/SeamlessTile.swift |   4 +-
+ 19 files changed, 274 insertions(+), 39 deletions(-)
+ create mode 100644 Apps/SeamlessTileTest/baseline.sha256
+ create mode 100755 Apps/SeamlessTileTest/e2e.sh
+
+diff --git a/Apps/SeamlessTileTest/baseline.sha256 b/Apps/SeamlessTileTest/baseline.sha256
+new file mode 100644
+index 0000000..95c861b
+--- /dev/null
++++ b/Apps/SeamlessTileTest/baseline.sha256
+@@ -0,0 +1,4 @@
++82df78d6dfbb8400fbd4e8d877bac025b70a038df0b187647231c06c62f99bfb  krea2.png
++309e41069bb7cac57b086261a1d041bc5f112dc9587312f90ae8bcce1eb23b41  zimage.png
++20e06f4b606e8641a6a3e2399f7c99ed5ba4afbe153277c7c1b8586ae044f37c  flux2.png
++e8abde9036486fa35d45567582197d703e3f7f0cc9409da82727962cffb9bc36  flux3.png
+diff --git a/Apps/SeamlessTileTest/e2e.sh b/Apps/SeamlessTileTest/e2e.sh
+new file mode 100755
+index 0000000..c42d7a8
+--- /dev/null
++++ b/Apps/SeamlessTileTest/e2e.sh
+@@ -0,0 +1,109 @@
++#!/bin/bash
++# Seamless tile, end to end: one generation per family with draw-things-cli, then the seam check of the
++# ComfyUI node (comfyui-pixaroma/nodes/_seamless_helpers.py, seam_check) on each picture.
++#
++# Usage:
++#   e2e.sh                      generate with seamlessTile = 3 (both) and check; exit 1 if a direction is not PASS
++#   e2e.sh --baseline           generate WITHOUT seamlessTile and print "sha256  family.png" lines
++#   e2e.sh --seam <png>...      only run the seam check on existing pictures (exit 1 if a direction is not PASS)
++#
++# baseline.sha256 next to this script: e2e.sh --baseline with the defaults below, made with a Release
++# draw-things-cli built from bcdc18f (before the generator read the flag). With the flag off, a newer build
++# must give the same bytes:
++#   OUT=/tmp/x e2e.sh --baseline && (cd /tmp/x && shasum -a 256 -c "$HERE/baseline.sha256")
++# Ming-Image (FAMILIES=ming) is not in it: two runs of the same binary already differ (max 22/255, mean
++# ~0.5), so Ming is compared by pixel difference against that run-to-run spread, not by sha256.
++#
++# Environment (all optional):
++#   DTCLI    draw-things-cli binary            (default: .build/out/Products/Release/draw-things-cli)
++#   MODELS   models folder of DT Hub's managed server (default: /Volumes/LLM-VLM/Models)
++#   OUT      output folder                     (default: ./seamless-e2e-out)
++#   FAMILIES families to run, space separated  (default: "krea2 zimage flux2 flux3")
++#   PROMPT   prompt                            (default: a stone texture)
++#   SIZE     width and height in px            (default: 1024)
++#   STEPS    sampling steps                    (default: 8)
++#   SEED     seed                              (default: 7)
++#   EXTRA    extra JSON keys merged into --config-json, e.g. '"hiresFix":true'
++#   TAG      suffix for the output file names
++set -euo pipefail
++
++HERE="$(cd "$(dirname "$0")" && pwd)"
++ROOT="$(cd "$HERE/../.." && pwd)"
++DTCLI="${DTCLI:-$ROOT/.build/out/Products/Release/draw-things-cli}"
++MODELS="${MODELS:-/Volumes/LLM-VLM/Models}"
++OUT="${OUT:-$PWD/seamless-e2e-out}"
++FAMILIES="${FAMILIES:-krea2 zimage flux2 flux3}"
++PROMPT="${PROMPT:-seamless texture of rough grey stone, top-down, even lighting}"
++SIZE="${SIZE:-1024}"
++STEPS="${STEPS:-8}"
++SEED="${SEED:-7}"
++EXTRA="${EXTRA:-}"
++TAG="${TAG:-}"
++COMFY="/Users/existenz/ComfyUI-Installs/eXistenZ/ComfyUI"
++PY="${PY:-$COMFY/.venv/bin/python3}"
++HELPERS="$COMFY/custom_nodes/comfyui-pixaroma/nodes/_seamless_helpers.py"
++
++model_for() {
++  case "$1" in
++    krea2) echo krea_2_turbo_i8x.ckpt ;;
++    zimage) echo z_image_1.0_i8x.ckpt ;;
++    flux2) echo flux_2_klein_9b_i8x.ckpt ;;
++    flux3) echo flux_3_klein_i8x.ckpt ;;
++    ming) echo ming_image_0.1_design_i8x.ckpt ;;
++    *) echo "unknown family $1" >&2; exit 2 ;;
++  esac
++}
++
++seam() {
++  # Prints one line per picture and exits 1 if a direction is not PASS.
++  "$PY" -I - "$HELPERS" "$@" <<'EOF'
++import importlib.util, sys
++import numpy as np, torch
++from PIL import Image
++spec = importlib.util.spec_from_file_location("seamless_helpers", sys.argv[1])
++h = importlib.util.module_from_spec(spec); spec.loader.exec_module(h)
++bad = 0
++for path in sys.argv[2:]:
++    img = torch.from_numpy(np.asarray(Image.open(path).convert("RGB"), dtype=np.float32) / 255.0)
++    r = h.seam_check(img)
++    lr, ud = r["left_right"], r["up_down"]
++    print(f"{path}: LR {lr['status']} ratio={lr['ratio']} vs_worst={lr.get('vs_worst')}  "
++          f"UD {ud['status']} ratio={ud['ratio']} vs_worst={ud.get('vs_worst')}")
++    bad += lr["status"] != "PASS" or ud["status"] != "PASS"
++sys.exit(1 if bad else 0)
++EOF
++}
++
++generate() { # family json output
++  "$DTCLI" generate --local --offline --disable-preview --models-dir "$MODELS" --model "$(model_for "$1")" \
++    --prompt "$PROMPT" --width "$SIZE" --height "$SIZE" --steps "$STEPS" --seed "$SEED" \
++    --config-json "$2" --output "$3"
++}
++
++json() { # seamless(0/1)
++  local keys=()
++  [ "$1" = 1 ] && keys+=('"seamlessTile":3')
++  [ -n "$EXTRA" ] && keys+=("$EXTRA")
++  local IFS=,
++  echo "{${keys[*]-}}"
++}
++
++if [ "${1:-}" = "--seam" ]; then
++  shift; seam "$@"; exit $?
++fi
++
++mkdir -p "$OUT"
++if [ "${1:-}" = "--baseline" ]; then
++  for f in $FAMILIES; do
++    generate "$f" "$(json 0)" "$OUT/$f$TAG.png" >"$OUT/$f$TAG.log" 2>&1
++    (cd "$OUT" && shasum -a 256 "$f$TAG.png")
++  done
++  exit 0
++fi
++
++pngs=()
++for f in $FAMILIES; do
++  generate "$f" "$(json 1)" "$OUT/$f-seamless$TAG.png" >"$OUT/$f-seamless$TAG.log" 2>&1
++  pngs+=("$OUT/$f-seamless$TAG.png")
++done
++seam "${pngs[@]}"
+diff --git a/Apps/SeamlessTileTest/main.swift b/Apps/SeamlessTileTest/main.swift
+index b01c6f3..2e54bf8 100644
+--- a/Apps/SeamlessTileTest/main.swift
++++ b/Apps/SeamlessTileTest/main.swift
+@@ -25,7 +25,7 @@ check(SeamlessTile(configurationValue: -1) == nil, "a negative value is off")
+ 
+ // Minimum turns per version.
+ check(SeamlessTile.minTurns(for: .zImage) == 1.0, "Z-Image 1.0")
+-check(SeamlessTile.minTurns(for: .krea2) == 0.5, "Krea 2 0.5")
++check(SeamlessTile.minTurns(for: .krea2) == 1.0, "Krea 2 1.0")
+ check(SeamlessTile.minTurns(for: .flux2) == 0.5, "FLUX.2 0.5")
+ check(SeamlessTile.minTurns(for: .flux2_9b) == 0.5, "FLUX.2 9B 0.5")
+ check(SeamlessTile.minTurns(for: .flux2_4b) == 0.5, "FLUX.2 4B 0.5")
+diff --git a/Libraries/LocalImageGenerator/Sources/LocalImageGenerator.swift b/Libraries/LocalImageGenerator/Sources/LocalImageGenerator.swift
+index 43a7366..db54d02 100644
+--- a/Libraries/LocalImageGenerator/Sources/LocalImageGenerator.swift
++++ b/Libraries/LocalImageGenerator/Sources/LocalImageGenerator.swift
+@@ -59,6 +59,10 @@ public struct LocalImageGenerator: ImageGenerator {
+   /// copy of the generator for one `generate` call, as MediaGenerationKit does from
+   /// `MediaGenerationPipeline.Configuration.scheduler`.
+   public var scheduler: Denoiser.Scheduler = .samplerDefault
++  /// Seamless tile of the current `generate` call, from `GenerationConfiguration.seamlessTile` and
++  /// only for Krea 2, Z-Image, FLUX.2 and FLUX.3 (nil otherwise). Set by `generate` on a copy of the
++  /// generator; every sampler (image RoPE) and first stage (decoder wrap) it builds carries it.
++  var seamlessTile: SeamlessTile? = nil
+   private let tokenizerV1Factory: () -> TextualInversionAttentionCLIPTokenizer
+   private let tokenizerV2Factory: () -> TextualInversionAttentionCLIPTokenizer
+   private let tokenizerXLFactory: () -> TextualInversionAttentionCLIPTokenizer
+@@ -1543,6 +1547,7 @@ extension LocalImageGenerator {
+         fileMapping: fileMapping, keywords: keywords, audioContext: audioContext,
+         cancellation: cancellation, feedback: feedback)
+     }
++    let originalHints = hints
+ 
+     let depth =
+       (hints.first {
+@@ -1583,6 +1588,46 @@ extension LocalImageGenerator {
+         ModelZoo.isModelDownloaded($0) ? $0 : nil
+       }) ?? ModelZoo.defaultSpecification.file
+     let modelVersion = ModelZoo.versionForModel(file)
++    // Seamless tile (`GenerationConfiguration.seamlessTile`), read only for the four families whose
++    // image RoPE and decoder know the torus; any other version (Ming-Image included) ignores it.
++    // Tiled diffusion and tiled decoding would cut the torus, so they are off for this call; run on
++    // a copy that has the tile and those settings, once (the copy matches, so it goes on).
++    let seamless =
++      SeamlessTile.minTurns(for: modelVersion) != nil
++      ? SeamlessTile(configurationValue: configuration.seamlessTile) : nil
++    if seamless != seamlessTile
++      || (seamless != nil && (configuration.tiledDiffusion || configuration.tiledDecoding))
++    {
++      var generator = self
++      generator.seamlessTile = seamless
++      var configuration = configuration
++      if seamless != nil {
++        var builder = GenerationConfigurationBuilder(from: configuration)
++        builder.tiledDiffusion = false
++        builder.tiledDecoding = false
++        configuration = builder.build()
++      }
++      return generator.generate(
++        trace: trace, image: image, scaleFactor: scaleFactor, mask: mask,
++        hints: originalHints, text: text, negativeText: negativeText,
++        configuration: configuration, fileMapping: fileMapping, keywords: keywords,
++        audioContext: audioContext, cancellation: cancellation, feedback: feedback)
++    }
++    if seamless != nil {
++      // Every pass (the HiRes fix first pass too) needs a latent grid the patch divides, that is a
++      // size in multiples of 16 px. Sizes come in 64 px units today, so this holds; it stays so a
++      // finer size unit can never give a generation whose torus doesn't close.
++      let sizes = [
++        Int(configuration.startWidth), Int(configuration.startHeight),
++      ]
++        + (configuration.hiresFix
++          ? [Int(configuration.hiresFixStartWidth), Int(configuration.hiresFixStartHeight)] : [])
++      guard sizes.allSatisfy({ ($0 * 64) % 16 == 0 }) else {
++        FileHandle.standardError.write(
++          Data("Seamless tile: the size must be a multiple of 16 px\n".utf8))
++        return (nil, nil, 1)
++      }
++    }
+     if audio != nil || audioContext != nil {
+       guard mask == nil else { return (nil, nil, 1) }
+       switch modelVersion {
+@@ -4811,7 +4856,7 @@ extension LocalImageGenerator {
+       ? (Int(configuration.causalInference), max(0, Int(configuration.causalInferencePad))) : (0, 0)
+     let cfgZeroStar = CfgZeroStarConfiguration(
+       isEnabled: configuration.cfgZeroStar, zeroInitSteps: Int(configuration.cfgZeroInitSteps))
+-    let sampler = LocalImageGenerator.sampler(
++    var sampler = LocalImageGenerator.sampler(
+       from: configuration.sampler, isCfgEnabled: isCfgEnabled,
+       filePath: ModelZoo.filePathForModelDownloaded(file), modifier: modifier,
+       version: modelVersion,
+@@ -4838,6 +4883,7 @@ extension LocalImageGenerator {
+       tiledDiffusion: tiledDiffusion, teaCache: teaCache, causalInference: causalInference,
+       cfgZeroStar: cfgZeroStar, isBF16: isBF16, weightsCache: weightsCache,
+       scheduler: scheduler, of: FloatType.self)
++    sampler.seamless = seamlessTile
+     let initTimestep = sampler.timestep(for: hiresFixStrength, sampling: sampling)
+     let hiresFixEnabled =
+       configuration.hiresFix && initTimestep.startStep > 0 && configuration.hiresFixStartWidth > 0
+@@ -5143,6 +5189,7 @@ extension LocalImageGenerator {
+         alternativeFilePath: alternativeDecoderFilePath,
+         alternativeDecoderVersion: alternativeDecoderVersion,
+         deviceProperties: DeviceCapability.deviceProperties)
++      firstStage.wrap = seamlessTile
+       var batchSize = (batchSize, 0)
+       switch modelVersion {
+       case .minimaxH3:
+@@ -5380,6 +5427,7 @@ extension LocalImageGenerator {
+         alternativeFilePath: alternativeDecoderFilePath,
+         alternativeDecoderVersion: alternativeDecoderVersion,
+         deviceProperties: DeviceCapability.deviceProperties)
++      firstStage.wrap = seamlessTile
+ 
+       if DeviceCapability.isLowPerformance {
+         graph.garbageCollect()
+@@ -5688,7 +5736,7 @@ extension LocalImageGenerator {
+         secondPassModelVersion = modelVersion
+         secondPassModelFilePath = ModelZoo.filePathForModelDownloaded(file)
+       }
+-      let secondPassSampler = LocalImageGenerator.sampler(
++      var secondPassSampler = LocalImageGenerator.sampler(
+         from: configuration.sampler, isCfgEnabled: isCfgEnabled,
+         filePath: secondPassModelFilePath, modifier: modifier,
+         version: secondPassModelVersion,
+@@ -5715,6 +5763,7 @@ extension LocalImageGenerator {
+         tiledDiffusion: tiledDiffusion, teaCache: teaCache, causalInference: causalInference,
+         cfgZeroStar: cfgZeroStar, isBF16: isBF16, weightsCache: weightsCache,
+         scheduler: scheduler, of: FloatType.self)
++      secondPassSampler.seamless = seamlessTile
+       let startStep: (integral: Int, fractional: Float)
+       let xEnc: DynamicGraph.Tensor<FloatType>
+       let secondPassTextGuidance: Float
+@@ -6220,7 +6269,7 @@ extension LocalImageGenerator {
+       ? (Int(configuration.causalInference), max(0, Int(configuration.causalInferencePad))) : (0, 0)
+     let cfgZeroStar = CfgZeroStarConfiguration(
+       isEnabled: configuration.cfgZeroStar, zeroInitSteps: Int(configuration.cfgZeroInitSteps))
+-    let sampler = LocalImageGenerator.sampler(
++    var sampler = LocalImageGenerator.sampler(
+       from: configuration.sampler, isCfgEnabled: isCfgEnabled,
+       filePath: ModelZoo.filePathForModelDownloaded(file), modifier: modifier,
+       version: modelVersion,
+@@ -6247,6 +6296,7 @@ extension LocalImageGenerator {
+       tiledDiffusion: tiledDiffusion, teaCache: teaCache, causalInference: causalInference,
+       cfgZeroStar: cfgZeroStar, isBF16: isBF16, weightsCache: weightsCache,
+       scheduler: scheduler, of: FloatType.self)
++    sampler.seamless = seamlessTile
+     let initTimestep = sampler.timestep(for: strength, sampling: sampling)
+     guard
+       initTimestep.startStep > 0 || modelVersion == .svdI2v || modelVersion == .seedvr2_3b
+@@ -6501,6 +6551,7 @@ extension LocalImageGenerator {
+         alternativeFilePath: alternativeDecoderFilePath,
+         alternativeDecoderVersion: alternativeDecoderVersion,
+         deviceProperties: DeviceCapability.deviceProperties)
++      firstStage.wrap = seamlessTile
+       // Check if strength is 0.
+       guard initTimestep.roundedDownStartStep < sampling.steps && configuration.strength > 0 else {
+         let image = faceRestoreImage(image, configuration: configuration)
+@@ -6736,6 +6787,7 @@ extension LocalImageGenerator {
+           alternativeFilePath: alternativeDecoderFilePath,
+           alternativeDecoderVersion: alternativeDecoderVersion,
+           deviceProperties: DeviceCapability.deviceProperties)
++        firstStage.wrap = seamlessTile
+         let (sample, encodedImage) = modelPreloader.consumeFirstStageSample(
+           firstStage.sample(
+             image,
+@@ -6773,7 +6825,7 @@ extension LocalImageGenerator {
+         let secondPassModelVersion = ModelVersion.wurstchenStageB
+         let secondPassModelFilePath = ModelZoo.filePathForModelDownloaded(
+           ModelZoo.stageModelsForModel(file)[0])
+-        let secondPassSampler = LocalImageGenerator.sampler(
++        var secondPassSampler = LocalImageGenerator.sampler(
+           from: configuration.sampler, isCfgEnabled: isCfgEnabled,
+           filePath: secondPassModelFilePath, modifier: modifier,
+           version: secondPassModelVersion,
+@@ -6801,6 +6853,7 @@ extension LocalImageGenerator {
+           cfgZeroStar: cfgZeroStar, isBF16: isBF16, weightsCache: weightsCache,
+           scheduler: scheduler, of: FloatType.self
+         )
++        secondPassSampler.seamless = seamlessTile
+         let noise = randomLatentNoise(
+           graph: graph, batchSize: batchSize.0, startHeight: startHeight,
+           startWidth: startWidth, channels: channels, seed: configuration.seed,
+@@ -7842,7 +7895,7 @@ extension LocalImageGenerator {
+       ? (Int(configuration.causalInference), max(0, Int(configuration.causalInferencePad))) : (0, 0)
+     let cfgZeroStar = CfgZeroStarConfiguration(
+       isEnabled: configuration.cfgZeroStar, zeroInitSteps: Int(configuration.cfgZeroInitSteps))
+-    let sampler = LocalImageGenerator.sampler(
++    var sampler = LocalImageGenerator.sampler(
+       from: configuration.sampler, isCfgEnabled: isCfgEnabled,
+       filePath: ModelZoo.filePathForModelDownloaded(file), modifier: modifier,
+       version: modelVersion,
+@@ -7869,6 +7922,7 @@ extension LocalImageGenerator {
+       tiledDiffusion: tiledDiffusion, teaCache: teaCache, causalInference: causalInference,
+       cfgZeroStar: cfgZeroStar, isBF16: isBF16, weightsCache: weightsCache,
+       scheduler: scheduler, of: FloatType.self)
++    sampler.seamless = seamlessTile
+     let initTimestep = sampler.timestep(for: strength, sampling: sampling)
+     let graph = DynamicGraph()
+     if externalOnDemand
+@@ -8009,6 +8063,7 @@ extension LocalImageGenerator {
+         alternativeFilePath: alternativeDecoderFilePath,
+         alternativeDecoderVersion: alternativeDecoderVersion,
+         deviceProperties: DeviceCapability.deviceProperties)
++      firstStage.wrap = seamlessTile
+       var firstPassImage: DynamicGraph.Tensor<FloatType>
+       if modelVersion == .wurstchenStageC {
+         // Try to resize the input image so we can encode with EfficientNetv2s properly.
+@@ -8251,6 +8306,7 @@ extension LocalImageGenerator {
+           alternativeFilePath: alternativeDecoderFilePath,
+           alternativeDecoderVersion: alternativeDecoderVersion,
+           deviceProperties: DeviceCapability.deviceProperties)
++        firstStage.wrap = seamlessTile
+         let (sample, _) = modelPreloader.consumeFirstStageSample(
+           firstStage.sample(
+             image,
+@@ -8265,7 +8321,7 @@ extension LocalImageGenerator {
+         let secondPassModelVersion = ModelVersion.wurstchenStageB
+         let secondPassModelFilePath = ModelZoo.filePathForModelDownloaded(
+           ModelZoo.stageModelsForModel(file)[0])
+-        let secondPassSampler = LocalImageGenerator.sampler(
++        var secondPassSampler = LocalImageGenerator.sampler(
+           from: configuration.sampler, isCfgEnabled: isCfgEnabled,
+           filePath: secondPassModelFilePath, modifier: modifier,
+           version: secondPassModelVersion,
+@@ -8293,6 +8349,7 @@ extension LocalImageGenerator {
+           cfgZeroStar: cfgZeroStar, isBF16: isBF16, weightsCache: weightsCache,
+           scheduler: scheduler, of: FloatType.self
+         )
++        secondPassSampler.seamless = seamlessTile
+         let noise = randomLatentNoise(
+           graph: graph, batchSize: batchSize.0, startHeight: startHeight,
+           startWidth: startWidth, channels: channels, seed: configuration.seed,
+@@ -8814,7 +8871,7 @@ extension LocalImageGenerator {
+       ? (Int(configuration.causalInference), max(0, Int(configuration.causalInferencePad))) : (0, 0)
+     let cfgZeroStar = CfgZeroStarConfiguration(
+       isEnabled: configuration.cfgZeroStar, zeroInitSteps: Int(configuration.cfgZeroInitSteps))
+-    let sampler = LocalImageGenerator.sampler(
++    var sampler = LocalImageGenerator.sampler(
+       from: configuration.sampler, isCfgEnabled: isCfgEnabled,
+       filePath: ModelZoo.filePathForModelDownloaded(file), modifier: modifier,
+       version: modelVersion,
+@@ -8841,6 +8898,7 @@ extension LocalImageGenerator {
+       tiledDiffusion: tiledDiffusion, teaCache: teaCache, causalInference: causalInference,
+       cfgZeroStar: cfgZeroStar, isBF16: isBF16, weightsCache: weightsCache,
+       scheduler: scheduler, of: FloatType.self)
++    sampler.seamless = seamlessTile
+     let initTimestep = sampler.timestep(for: strength, sampling: sampling)
+     let graph = DynamicGraph()
+     if externalOnDemand
+@@ -8980,6 +9038,7 @@ extension LocalImageGenerator {
+         alternativeFilePath: alternativeDecoderFilePath,
+         alternativeDecoderVersion: alternativeDecoderVersion,
+         deviceProperties: DeviceCapability.deviceProperties)
++      firstStage.wrap = seamlessTile
+       var firstPassImage: DynamicGraph.Tensor<FloatType>
+       if modelVersion == .wurstchenStageC {
+         // Try to resize the input image so we can encode with EfficientNetv2s properly.
+@@ -9369,6 +9428,7 @@ extension LocalImageGenerator {
+           alternativeFilePath: alternativeDecoderFilePath,
+           alternativeDecoderVersion: alternativeDecoderVersion,
+           deviceProperties: DeviceCapability.deviceProperties)
++        firstStage.wrap = seamlessTile
+         let (sample, _) = modelPreloader.consumeFirstStageSample(
+           firstStage.sample(
+             image,
+@@ -9383,7 +9443,7 @@ extension LocalImageGenerator {
+         let secondPassModelVersion = ModelVersion.wurstchenStageB
+         let secondPassModelFilePath = ModelZoo.filePathForModelDownloaded(
+           ModelZoo.stageModelsForModel(file)[0])
+-        let secondPassSampler = LocalImageGenerator.sampler(
++        var secondPassSampler = LocalImageGenerator.sampler(
+           from: configuration.sampler, isCfgEnabled: isCfgEnabled,
+           filePath: secondPassModelFilePath, modifier: modifier,
+           version: secondPassModelVersion,
+@@ -9411,6 +9471,7 @@ extension LocalImageGenerator {
+           cfgZeroStar: cfgZeroStar, isBF16: isBF16, weightsCache: weightsCache,
+           scheduler: scheduler, of: FloatType.self
+         )
++        secondPassSampler.seamless = seamlessTile
+         let noise = randomLatentNoise(
+           graph: graph, batchSize: batchSize.0, startHeight: startHeight,
+           startWidth: startWidth, channels: channels, seed: configuration.seed,
+diff --git a/Libraries/LocalImageGenerator/Sources/ModelPreloader.swift b/Libraries/LocalImageGenerator/Sources/ModelPreloader.swift
+index 288f644..26204a5 100644
+--- a/Libraries/LocalImageGenerator/Sources/ModelPreloader.swift
++++ b/Libraries/LocalImageGenerator/Sources/ModelPreloader.swift
+@@ -88,6 +88,8 @@ public final class ModelPreloader {
+   private var firstStageDecoderScale: DeviceCapability.Scale? = nil
+   private var firstStageDecoderHighPrecision: Bool? = nil
+   private var firstStageDecoderTiledDecoding: TiledConfiguration? = nil
++  // A decoder built with the seamless wrap is a different graph: it never serves a request without it.
++  private var firstStageDecoderWrap: SeamlessTile? = nil
+ 
+   private var textEncoderFilePaths: [String]? = nil
+   private var textEncoderVersion: ModelVersion? = nil
+@@ -465,6 +467,7 @@ extension ModelPreloader {
+     firstStageDecoderVersion = nil
+     firstStageDecoderHighPrecision = nil
+     firstStageDecoderTiledDecoding = nil
++    firstStageDecoderWrap = nil
+     textModel = nil
+     textEncoderVersion = nil
+     textEncoderInjectEmbeddings = false
+@@ -716,6 +719,7 @@ extension ModelPreloader {
+         firstStageDecoderVersion = modelVersion
+         firstStageDecoderHighPrecision = highPrecisionForAutoencoder
+         firstStageDecoderTiledDecoding = tiledDecoding
++        firstStageDecoderWrap = nil
+       }
+       if firstStageEncoder == nil {
+         let startHeight =
+@@ -1347,7 +1351,8 @@ extension ModelPreloader {
+       firstStageDecoderVersion == firstStage.version,
+       firstStageDecoderScale == scale,
+       firstStageDecoderHighPrecision == firstStage.highPrecisionKeysAndValues,
+-      firstStageDecoderTiledDecoding == firstStage.tiledDecoding
++      firstStageDecoderTiledDecoding == firstStage.tiledDecoding,
++      firstStageDecoderWrap == firstStage.wrap
+     else {
+       firstStageDecoder = nil
+       return nil
+@@ -1369,6 +1374,7 @@ extension ModelPreloader {
+       firstStageDecoderScale = scale
+       firstStageDecoderHighPrecision = firstStage.highPrecisionKeysAndValues
+       firstStageDecoderTiledDecoding = firstStage.tiledDecoding
++      firstStageDecoderWrap = firstStage.wrap
+     }
+     return (x.0, x.1)
+   }
+diff --git a/Libraries/Scripting/Sources/ScriptModels.swift b/Libraries/Scripting/Sources/ScriptModels.swift
+index 1ed649f..7dbc08f 100644
+--- a/Libraries/Scripting/Sources/ScriptModels.swift
++++ b/Libraries/Scripting/Sources/ScriptModels.swift
+@@ -158,6 +158,9 @@ public final class JSGenerationConfiguration: Codable {
+   public var usesSolAttention: Bool?
+   public var solAttentionStart: Int32?
+   public var solAttentionTau: Float?
++  /// Seamless tile (0 off, 1 left-right, 2 up-down, 3 both). nil when off, so the JSON of a normal
++  /// configuration has no new key.
++  public var seamlessTile: Int8?
+   public var stage2Steps: UInt32
+   public var stage2Guidance: Float32
+   public var stage2Shift: Float32
+@@ -248,6 +251,7 @@ public final class JSGenerationConfiguration: Codable {
+     usesSolAttention = configuration.usesSolAttention
+     solAttentionStart = configuration.solAttentionStart
+     solAttentionTau = configuration.solAttentionTau
++    seamlessTile = configuration.seamlessTile == 0 ? nil : configuration.seamlessTile
+     stage2Guidance = configuration.stage2Cfg
+     stage2Shift = configuration.stage2Shift
+     stage2Steps = configuration.stage2Steps
+@@ -383,7 +387,8 @@ public final class JSGenerationConfiguration: Codable {
+       shiftForAudio: shiftForAudio,
+       usesSolAttention: usesSolAttention,
+       solAttentionStart: solAttentionStart,
+-      solAttentionTau: solAttentionTau
++      solAttentionTau: solAttentionTau,
++      seamlessTile: seamlessTile
+     )
+   }
+ }
+diff --git a/Libraries/SwiftDiffusion/Sources/FirstStage.swift b/Libraries/SwiftDiffusion/Sources/FirstStage.swift
+index b7f805d..8c402b3 100644
+--- a/Libraries/SwiftDiffusion/Sources/FirstStage.swift
++++ b/Libraries/SwiftDiffusion/Sources/FirstStage.swift
+@@ -27,6 +27,9 @@ public struct FirstStage<FloatType: TensorNumeric & BinaryFloatingPoint> {
+   private let highPrecisionFallback: Bool
+   private let deviceProperties: DeviceProperties
+   private let isCancelled = ManagedAtomic<Bool>(false)
++  /// Seamless tile: the decoder of Krea 2, Z-Image, FLUX.2 and FLUX.3 wraps its padding on these
++  /// axes and decodes the whole latent at once (no tiles). nil = today's decoder.
++  public var wrap: SeamlessTile? = nil
+   public init(
+     filePath: String, version: ModelVersion,
+     latentsScaling: (
+@@ -150,6 +153,10 @@ extension FirstStage {
+   )
+     -> (DynamicGraph.Tensor<FloatType>, DynamicGraph.Tensor<Float>?, Model?)
+   {
++    // Only the four seamless families read the wrap. A wrapped decoder is a different graph built at
++    // the whole latent size, so a cached decoder is never reused for it.
++    let wrap = SeamlessTile.minTurns(for: version) != nil ? self.wrap : nil
++    let existingDecoder = wrap == nil ? existingDecoder : nil
+     let shape = x.shape
+     let batchSize = shape[0]
+     var startHeight = shape[1]
+@@ -301,8 +308,9 @@ extension FirstStage {
+     )
+     // Cut by half because we will * 2 later.
+     var decodingTileOverlap = (tiledDecodingConfiguration.tileOverlap * (64 / scaleFactor) + 1) / 2
++    // A tiled decode would cut the torus: with the wrap the latent is decoded whole.
+     var tiledDecoding =
+-      tiledDecodingConfiguration.isEnabled
++      wrap == nil && tiledDecodingConfiguration.isEnabled
+       && (startWidth > decodingTileSize.width || startHeight > decodingTileSize.height)
+     let externalData: DynamicGraph.Store.Codec =
+       externalOnDemand ? .externalOnDemand : .externalData
+@@ -384,8 +392,9 @@ extension FirstStage {
+           startHeight: startHeight, inputChannels: 16,
+           highPrecisionKeysAndValues: highPrecisionKeysAndValues,
+           usesFlashAttention: decoderUsesFlashAttention,
+-          paddingFinalConvLayer: true, format: deviceProperties.isNHWCPreferred ? .NHWC : .NCHW,
+-          quantLayer: false
++          paddingFinalConvLayer: true,
++          format: wrap != nil || deviceProperties.isNHWCPreferred ? .NHWC : .NCHW,
++          quantLayer: false, wrap: wrap
+         ).0
+       if existingDecoder == nil {
+         decoder.maxConcurrency = .limit(4)
+@@ -544,8 +553,9 @@ extension FirstStage {
+           startHeight: startHeight, inputChannels: 32,
+           highPrecisionKeysAndValues: highPrecisionKeysAndValues,
+           usesFlashAttention: decoderUsesFlashAttention,
+-          paddingFinalConvLayer: true, format: deviceProperties.isNHWCPreferred ? .NHWC : .NCHW,
+-          quantLayer: true, specializingNames: true
++          paddingFinalConvLayer: true,
++          format: wrap != nil || deviceProperties.isNHWCPreferred ? .NHWC : .NCHW,
++          quantLayer: true, specializingNames: true, wrap: wrap
+         ).0
+       if existingDecoder == nil {
+         decoder.maxConcurrency = .limit(4)
+@@ -704,7 +714,9 @@ extension FirstStage {
+       } else {
+         sizeLimit = 1024
+       }
+-      if startWidth > sizeLimit || startHeight > sizeLimit {
++      // With the wrap (Krea 2 seamless) the latent is decoded whole even past the limit: if memory
++      // runs out the error surfaces, never a tiled decode without the wrap.
++      if wrap == nil && (startWidth > sizeLimit || startHeight > sizeLimit) {
+         // We turn on tiled decoding forcefully.
+         if !tiledDecoding {
+           decodingTileOverlap = 4
+@@ -730,7 +742,7 @@ extension FirstStage {
+           outputChannels: alternativeDecoderVersion == .transparent ? 4 : 3,
+           highPrecisionFinalNorm: alternativeDecoderVersion == .transparent,
+           usesFlashAttention: decoderUsesFlashAttention,
+-          format: deviceProperties.isNHWCPreferred ? .NHWC : .NCHW
++          format: wrap != nil || deviceProperties.isNHWCPreferred ? .NHWC : .NCHW, wrap: wrap
+         ).1
+       if existingDecoder == nil {
+         decoder.maxConcurrency = .limit(4)
+diff --git a/Libraries/SwiftDiffusion/Sources/Models/Krea2.swift b/Libraries/SwiftDiffusion/Sources/Models/Krea2.swift
+index f362731..f568c15 100644
+--- a/Libraries/SwiftDiffusion/Sources/Models/Krea2.swift
++++ b/Libraries/SwiftDiffusion/Sources/Models/Krea2.swift
+@@ -6,7 +6,7 @@ public func Krea2RotaryPositionEmbedding<FloatType: TensorNumeric & BinaryFloati
+   of dataType: FloatType.Type = FloatType.self, seamless: SeamlessTile? = nil
+ ) -> Tensor<FloatType> {
+   let ropeTheta: Double = 1_000
+-  let seamlessMinTurns = 0.5
++  let seamlessMinTurns = 1.0
+   let imageLength = gridHeight * gridWidth
+   // Layout is [image | references | text]. Each reference has the same grid as the image and sits
+   // at the same (y, x); only its first axis (frame) differs: 0 for the image, i + 1 for reference i.
+diff --git a/Libraries/SwiftDiffusion/Sources/Samplers/ComfyMultistepSampler.swift b/Libraries/SwiftDiffusion/Sources/Samplers/ComfyMultistepSampler.swift
+index 1ce3daa..a6f7bcb 100644
+--- a/Libraries/SwiftDiffusion/Sources/Samplers/ComfyMultistepSampler.swift
++++ b/Libraries/SwiftDiffusion/Sources/Samplers/ComfyMultistepSampler.swift
+@@ -51,6 +51,8 @@ where UNet.FloatType == FloatType {
+   public let causalInference: (Int, pad: Int)
+   public let cfgZeroStar: CfgZeroStarConfiguration
+   public let isBF16: Bool
++  /// Seamless tile for the image RoPE (Krea 2, Z-Image, FLUX.2, FLUX.3); nil = off.
++  public var seamless: SeamlessTile? = nil
+   private let discretization: Discretization
+   private let weightsCache: WeightsCache
+   public init(
+@@ -196,7 +198,7 @@ extension ComfyMultistepSampler: Sampler {
+     let result: Result<SamplerOutput<FloatType, UNet>, Error> = graph.withStream(streamContext) {
+       let oldC = c
+       var conditions: [DynamicGraph.AnyTensor] = c
+-      let fixedEncoder = UNetFixedEncoder<FloatType>(
++      var fixedEncoder = UNetFixedEncoder<FloatType>(
+         filePath: filePath, version: version, modifier: modifier,
+         dualAttentionLayers: dualAttentionLayers, activationQkScaling: activationQkScaling,
+         activationProjScaling: activationProjScaling,
+@@ -206,6 +208,7 @@ extension ComfyMultistepSampler: Sampler {
+         zeroNegativePrompt: zeroNegativePrompt, isQuantizedModel: isQuantizedModel,
+         canRunLoRASeparately: canRunLoRASeparately, externalOnDemand: externalOnDemand,
+         deviceProperties: deviceProperties, weightsCache: weightsCache)
++      fixedEncoder.seamless = seamless
+       let injectedControlsC: [[DynamicGraph.Tensor<FloatType>]]
+       let alphasCumprod = discretization.alphasCumprod(steps: sampling.steps, shift: sampling.shift)
+       let sigmas = alphasCumprod.map { discretization.sigma(from: $0) }
+@@ -619,7 +622,7 @@ extension ComfyMultistepSampler: Sampler {
+             + listOfLoras.filter {
+               $0.mode == .all || $0.mode == .refiner
+             }
+-          let fixedEncoder = UNetFixedEncoder<FloatType>(
++          var fixedEncoder = UNetFixedEncoder<FloatType>(
+             filePath: refiner.filePath, version: refiner.version,
+             modifier: modifier, dualAttentionLayers: refiner.dualAttentionLayers,
+             activationQkScaling: refiner.activationQkScaling,
+@@ -631,6 +634,7 @@ extension ComfyMultistepSampler: Sampler {
+             isQuantizedModel: refiner.isQuantizedModel, canRunLoRASeparately: canRunLoRASeparately,
+             externalOnDemand: refiner.externalOnDemand, deviceProperties: deviceProperties,
+             weightsCache: weightsCache)
++          fixedEncoder.seamless = seamless
+           if UNetFixedEncoder<FloatType>.isFixedEncoderRequired(version: refiner.version) {
+             conditions = []
+             let vector = fixedEncoder.vector(
+diff --git a/Libraries/SwiftDiffusion/Sources/Samplers/DDIMSampler.swift b/Libraries/SwiftDiffusion/Sources/Samplers/DDIMSampler.swift
+index 8e84916..3acf70f 100644
+--- a/Libraries/SwiftDiffusion/Sources/Samplers/DDIMSampler.swift
++++ b/Libraries/SwiftDiffusion/Sources/Samplers/DDIMSampler.swift
+@@ -41,6 +41,8 @@ where UNet.FloatType == FloatType {
+   public let causalInference: (Int, pad: Int)
+   public let cfgZeroStar: CfgZeroStarConfiguration
+   public let isBF16: Bool
++  /// Seamless tile for the image RoPE (Krea 2, Z-Image, FLUX.2, FLUX.3); nil = off.
++  public var seamless: SeamlessTile? = nil
+   private let discretization: Discretization
+   private let weightsCache: WeightsCache
+   public init(
+@@ -186,7 +188,7 @@ extension DDIMSampler: Sampler {
+     let result: Result<SamplerOutput<FloatType, UNet>, Error> = graph.withStream(streamContext) {
+       let oldC = c
+       var conditions: [DynamicGraph.AnyTensor] = c
+-      let fixedEncoder = UNetFixedEncoder<FloatType>(
++      var fixedEncoder = UNetFixedEncoder<FloatType>(
+         filePath: filePath, version: version, modifier: modifier,
+         dualAttentionLayers: dualAttentionLayers, activationQkScaling: activationQkScaling,
+         activationProjScaling: activationProjScaling,
+@@ -196,6 +198,7 @@ extension DDIMSampler: Sampler {
+         zeroNegativePrompt: zeroNegativePrompt, isQuantizedModel: isQuantizedModel,
+         canRunLoRASeparately: canRunLoRASeparately, externalOnDemand: externalOnDemand,
+         deviceProperties: deviceProperties, weightsCache: weightsCache)
++      fixedEncoder.seamless = seamless
+       let injectedControlsC: [[DynamicGraph.Tensor<FloatType>]]
+       let alphasCumprod = discretization.alphasCumprod(steps: sampling.steps, shift: sampling.shift)
+       let timesteps = (startStep.integral..<endStep.integral).map {
+@@ -416,7 +419,7 @@ extension DDIMSampler: Sampler {
+             + listOfLoras.filter {
+               $0.mode == .all || $0.mode == .refiner
+             }
+-          let fixedEncoder = UNetFixedEncoder<FloatType>(
++          var fixedEncoder = UNetFixedEncoder<FloatType>(
+             filePath: refiner.filePath, version: refiner.version,
+             modifier: modifier,
+             dualAttentionLayers: refiner.dualAttentionLayers,
+@@ -429,6 +432,7 @@ extension DDIMSampler: Sampler {
+             isQuantizedModel: refiner.isQuantizedModel, canRunLoRASeparately: canRunLoRASeparately,
+             externalOnDemand: refiner.externalOnDemand, deviceProperties: deviceProperties,
+             weightsCache: weightsCache)
++          fixedEncoder.seamless = seamless
+           if UNetFixedEncoder<FloatType>.isFixedEncoderRequired(version: refiner.version) {
+             conditions = []
+             let vector = fixedEncoder.vector(
+diff --git a/Libraries/SwiftDiffusion/Sources/Samplers/DPMPP2MSampler.swift b/Libraries/SwiftDiffusion/Sources/Samplers/DPMPP2MSampler.swift
+index e296dae..f67658a 100644
+--- a/Libraries/SwiftDiffusion/Sources/Samplers/DPMPP2MSampler.swift
++++ b/Libraries/SwiftDiffusion/Sources/Samplers/DPMPP2MSampler.swift
+@@ -41,6 +41,8 @@ where UNet.FloatType == FloatType {
+   public let causalInference: (Int, pad: Int)
+   public let cfgZeroStar: CfgZeroStarConfiguration
+   public let isBF16: Bool
++  /// Seamless tile for the image RoPE (Krea 2, Z-Image, FLUX.2, FLUX.3); nil = off.
++  public var seamless: SeamlessTile? = nil
+   private let discretization: Discretization
+   private let weightsCache: WeightsCache
+   public init(
+@@ -186,7 +188,7 @@ extension DPMPP2MSampler: Sampler {
+     let result: Result<SamplerOutput<FloatType, UNet>, Error> = graph.withStream(streamContext) {
+       let oldC = c
+       var conditions: [DynamicGraph.AnyTensor] = c
+-      let fixedEncoder = UNetFixedEncoder<FloatType>(
++      var fixedEncoder = UNetFixedEncoder<FloatType>(
+         filePath: filePath, version: version, modifier: modifier,
+         dualAttentionLayers: dualAttentionLayers, activationQkScaling: activationQkScaling,
+         activationProjScaling: activationProjScaling,
+@@ -196,6 +198,7 @@ extension DPMPP2MSampler: Sampler {
+         zeroNegativePrompt: zeroNegativePrompt, isQuantizedModel: isQuantizedModel,
+         canRunLoRASeparately: canRunLoRASeparately, externalOnDemand: externalOnDemand,
+         deviceProperties: deviceProperties, weightsCache: weightsCache)
++      fixedEncoder.seamless = seamless
+       let injectedControlsC: [[DynamicGraph.Tensor<FloatType>]]
+       let alphasCumprod = discretization.alphasCumprod(steps: sampling.steps, shift: sampling.shift)
+       var sigmas = alphasCumprod.map { discretization.sigma(from: $0) }
+@@ -436,7 +439,7 @@ extension DPMPP2MSampler: Sampler {
+             + listOfLoras.filter {
+               $0.mode == .all || $0.mode == .refiner
+             }
+-          let fixedEncoder = UNetFixedEncoder<FloatType>(
++          var fixedEncoder = UNetFixedEncoder<FloatType>(
+             filePath: refiner.filePath, version: refiner.version,
+             modifier: modifier, dualAttentionLayers: refiner.dualAttentionLayers,
+             activationQkScaling: refiner.activationQkScaling,
+@@ -448,6 +451,7 @@ extension DPMPP2MSampler: Sampler {
+             isQuantizedModel: refiner.isQuantizedModel, canRunLoRASeparately: canRunLoRASeparately,
+             externalOnDemand: refiner.externalOnDemand, deviceProperties: deviceProperties,
+             weightsCache: weightsCache)
++          fixedEncoder.seamless = seamless
+           if UNetFixedEncoder<FloatType>.isFixedEncoderRequired(version: refiner.version) {
+             conditions = []
+             let vector = fixedEncoder.vector(
+diff --git a/Libraries/SwiftDiffusion/Sources/Samplers/DPMPPSDESampler.swift b/Libraries/SwiftDiffusion/Sources/Samplers/DPMPPSDESampler.swift
+index 82cb187..64b8849 100644
+--- a/Libraries/SwiftDiffusion/Sources/Samplers/DPMPPSDESampler.swift
++++ b/Libraries/SwiftDiffusion/Sources/Samplers/DPMPPSDESampler.swift
+@@ -41,6 +41,8 @@ where UNet.FloatType == FloatType {
+   public let causalInference: (Int, pad: Int)
+   public let cfgZeroStar: CfgZeroStarConfiguration
+   public let isBF16: Bool
++  /// Seamless tile for the image RoPE (Krea 2, Z-Image, FLUX.2, FLUX.3); nil = off.
++  public var seamless: SeamlessTile? = nil
+   private let discretization: Discretization
+   private let weightsCache: WeightsCache
+   public init(
+@@ -186,7 +188,7 @@ extension DPMPPSDESampler: Sampler {
+     let result: Result<SamplerOutput<FloatType, UNet>, Error> = graph.withStream(streamContext) {
+       let oldC = c
+       var allConditions: [DynamicGraph.AnyTensor] = c
+-      let fixedEncoder = UNetFixedEncoder<FloatType>(
++      var fixedEncoder = UNetFixedEncoder<FloatType>(
+         filePath: filePath, version: version, modifier: modifier,
+         dualAttentionLayers: dualAttentionLayers, activationQkScaling: activationQkScaling,
+         activationProjScaling: activationProjScaling,
+@@ -196,6 +198,7 @@ extension DPMPPSDESampler: Sampler {
+         zeroNegativePrompt: zeroNegativePrompt, isQuantizedModel: isQuantizedModel,
+         canRunLoRASeparately: canRunLoRASeparately, externalOnDemand: externalOnDemand,
+         deviceProperties: deviceProperties, weightsCache: weightsCache)
++      fixedEncoder.seamless = seamless
+       let injectedControlsC: [[DynamicGraph.Tensor<FloatType>]]
+       let alphasCumprod = discretization.alphasCumprod(steps: sampling.steps, shift: sampling.shift)
+       let sigmas = alphasCumprod.map { discretization.sigma(from: $0) }
+@@ -437,7 +440,7 @@ extension DPMPPSDESampler: Sampler {
+             + listOfLoras.filter {
+               $0.mode == .all || $0.mode == .refiner
+             }
+-          let fixedEncoder = UNetFixedEncoder<FloatType>(
++          var fixedEncoder = UNetFixedEncoder<FloatType>(
+             filePath: refiner.filePath, version: refiner.version,
+             modifier: modifier, dualAttentionLayers: refiner.dualAttentionLayers,
+             activationQkScaling: refiner.activationQkScaling,
+@@ -449,6 +452,7 @@ extension DPMPPSDESampler: Sampler {
+             isQuantizedModel: refiner.isQuantizedModel, canRunLoRASeparately: canRunLoRASeparately,
+             externalOnDemand: refiner.externalOnDemand, deviceProperties: deviceProperties,
+             weightsCache: weightsCache)
++          fixedEncoder.seamless = seamless
+           if UNetFixedEncoder<FloatType>.isFixedEncoderRequired(version: refiner.version) {
+             allConditions = []
+             let vector = fixedEncoder.vector(
+diff --git a/Libraries/SwiftDiffusion/Sources/Samplers/EulerASampler.swift b/Libraries/SwiftDiffusion/Sources/Samplers/EulerASampler.swift
+index 56907a5..9ea935c 100644
+--- a/Libraries/SwiftDiffusion/Sources/Samplers/EulerASampler.swift
++++ b/Libraries/SwiftDiffusion/Sources/Samplers/EulerASampler.swift
+@@ -41,6 +41,8 @@ where UNet.FloatType == FloatType {
+   public let causalInference: (Int, pad: Int)
+   public let cfgZeroStar: CfgZeroStarConfiguration
+   public let isBF16: Bool
++  /// Seamless tile for the image RoPE (Krea 2, Z-Image, FLUX.2, FLUX.3); nil = off.
++  public var seamless: SeamlessTile? = nil
+   private let discretization: Discretization
+   private let weightsCache: WeightsCache
+   public init(
+@@ -186,7 +188,7 @@ extension EulerASampler: Sampler {
+     let result: Result<SamplerOutput<FloatType, UNet>, Error> = graph.withStream(streamContext) {
+       let oldC = c
+       var conditions: [DynamicGraph.AnyTensor] = c
+-      let fixedEncoder = UNetFixedEncoder<FloatType>(
++      var fixedEncoder = UNetFixedEncoder<FloatType>(
+         filePath: filePath, version: version, modifier: modifier,
+         dualAttentionLayers: dualAttentionLayers, activationQkScaling: activationQkScaling,
+         activationProjScaling: activationProjScaling,
+@@ -196,6 +198,7 @@ extension EulerASampler: Sampler {
+         zeroNegativePrompt: zeroNegativePrompt, isQuantizedModel: isQuantizedModel,
+         canRunLoRASeparately: canRunLoRASeparately, externalOnDemand: externalOnDemand,
+         deviceProperties: deviceProperties, weightsCache: weightsCache)
++      fixedEncoder.seamless = seamless
+       let injectedControlsC: [[DynamicGraph.Tensor<FloatType>]]
+       let alphasCumprod = discretization.alphasCumprod(steps: sampling.steps, shift: sampling.shift)
+       let sigmas = alphasCumprod.map { discretization.sigma(from: $0) }
+@@ -433,7 +436,7 @@ extension EulerASampler: Sampler {
+             + listOfLoras.filter {
+               $0.mode == .all || $0.mode == .refiner
+             }
+-          let fixedEncoder = UNetFixedEncoder<FloatType>(
++          var fixedEncoder = UNetFixedEncoder<FloatType>(
+             filePath: refiner.filePath, version: refiner.version,
+             modifier: modifier, dualAttentionLayers: refiner.dualAttentionLayers,
+             activationQkScaling: refiner.activationQkScaling,
+@@ -445,6 +448,7 @@ extension EulerASampler: Sampler {
+             isQuantizedModel: refiner.isQuantizedModel, canRunLoRASeparately: canRunLoRASeparately,
+             externalOnDemand: refiner.externalOnDemand, deviceProperties: deviceProperties,
+             weightsCache: weightsCache)
++          fixedEncoder.seamless = seamless
+           if UNetFixedEncoder<FloatType>.isFixedEncoderRequired(version: refiner.version) {
+             conditions = []
+             let vector = fixedEncoder.vector(
+diff --git a/Libraries/SwiftDiffusion/Sources/Samplers/LCMSampler.swift b/Libraries/SwiftDiffusion/Sources/Samplers/LCMSampler.swift
+index 47a798a..3d89dba 100644
+--- a/Libraries/SwiftDiffusion/Sources/Samplers/LCMSampler.swift
++++ b/Libraries/SwiftDiffusion/Sources/Samplers/LCMSampler.swift
+@@ -39,6 +39,8 @@ where UNet.FloatType == FloatType {
+   public let teaCache: TeaCacheConfiguration
+   public let causalInference: (Int, pad: Int)
+   public let isBF16: Bool
++  /// Seamless tile for the image RoPE (Krea 2, Z-Image, FLUX.2, FLUX.3); nil = off.
++  public var seamless: SeamlessTile? = nil
+   private let discretization: Discretization
+   /// Steps on `discretization.alphasCumprod(steps:shift:)`, as ComfyUI's `sample_lcm` steps on
+   /// whatever sigmas its scheduler gives, instead of LCM's own 1000-entry index table. Set for a
+@@ -223,7 +225,7 @@ extension LCMSampler: Sampler {
+     let result: Result<SamplerOutput<FloatType, UNet>, Error> = graph.withStream(streamContext) {
+       let oldC = c
+       var conditions: [DynamicGraph.AnyTensor] = c
+-      let fixedEncoder = UNetFixedEncoder<FloatType>(
++      var fixedEncoder = UNetFixedEncoder<FloatType>(
+         filePath: filePath, version: version, modifier: modifier,
+         dualAttentionLayers: dualAttentionLayers, activationQkScaling: activationQkScaling,
+         activationProjScaling: activationProjScaling,
+@@ -233,6 +235,7 @@ extension LCMSampler: Sampler {
+         zeroNegativePrompt: zeroNegativePrompt, isQuantizedModel: isQuantizedModel,
+         canRunLoRASeparately: canRunLoRASeparately, externalOnDemand: externalOnDemand,
+         deviceProperties: deviceProperties, weightsCache: weightsCache)
++      fixedEncoder.seamless = seamless
+       let injectedControlsC: [[DynamicGraph.Tensor<FloatType>]]
+       // Per step: the alphaCumprod (and sigma) it denoises from, the one it renoises to, what the
+       // model is told, and LCM's boundary-condition scalings (c_skip, c_out).
+@@ -533,7 +536,7 @@ extension LCMSampler: Sampler {
+             + listOfLoras.filter {
+               $0.mode == .all || $0.mode == .refiner
+             }
+-          let fixedEncoder = UNetFixedEncoder<FloatType>(
++          var fixedEncoder = UNetFixedEncoder<FloatType>(
+             filePath: refiner.filePath, version: refiner.version,
+             modifier: modifier, dualAttentionLayers: refiner.dualAttentionLayers,
+             activationQkScaling: refiner.activationQkScaling,
+@@ -545,6 +548,7 @@ extension LCMSampler: Sampler {
+             isQuantizedModel: refiner.isQuantizedModel, canRunLoRASeparately: canRunLoRASeparately,
+             externalOnDemand: refiner.externalOnDemand, deviceProperties: deviceProperties,
+             weightsCache: weightsCache)
++          fixedEncoder.seamless = seamless
+           if UNetFixedEncoder<FloatType>.isFixedEncoderRequired(version: refiner.version) {
+             conditions = []
+             let vector = fixedEncoder.vector(
+diff --git a/Libraries/SwiftDiffusion/Sources/Samplers/PLMSSampler.swift b/Libraries/SwiftDiffusion/Sources/Samplers/PLMSSampler.swift
+index 6119857..09c0b33 100644
+--- a/Libraries/SwiftDiffusion/Sources/Samplers/PLMSSampler.swift
++++ b/Libraries/SwiftDiffusion/Sources/Samplers/PLMSSampler.swift
+@@ -51,6 +51,8 @@ where UNet.FloatType == FloatType {
+   public let causalInference: (Int, pad: Int)
+   public let cfgZeroStar: CfgZeroStarConfiguration
+   public let isBF16: Bool
++  /// Seamless tile for the image RoPE (Krea 2, Z-Image, FLUX.2, FLUX.3); nil = off.
++  public var seamless: SeamlessTile? = nil
+   private let discretization: Discretization
+   private let weightsCache: WeightsCache
+   public init(
+@@ -198,7 +200,7 @@ extension PLMSSampler: Sampler {
+     let result: Result<SamplerOutput<FloatType, UNet>, Error> = graph.withStream(streamContext) {
+       let oldC = c
+       var conditions: [DynamicGraph.AnyTensor] = c
+-      let fixedEncoder = UNetFixedEncoder<FloatType>(
++      var fixedEncoder = UNetFixedEncoder<FloatType>(
+         filePath: filePath, version: version, modifier: modifier,
+         dualAttentionLayers: dualAttentionLayers, activationQkScaling: activationQkScaling,
+         activationProjScaling: activationProjScaling,
+@@ -208,6 +210,7 @@ extension PLMSSampler: Sampler {
+         zeroNegativePrompt: zeroNegativePrompt, isQuantizedModel: isQuantizedModel,
+         canRunLoRASeparately: canRunLoRASeparately, externalOnDemand: externalOnDemand,
+         deviceProperties: deviceProperties, weightsCache: weightsCache)
++      fixedEncoder.seamless = seamless
+       let injectedControlsC: [[DynamicGraph.Tensor<FloatType>]]
+       let alphasCumprod = discretization.alphasCumprod(steps: sampling.steps, shift: sampling.shift)
+       let timesteps = (startStep..<endStep).map {
+@@ -401,7 +404,7 @@ extension PLMSSampler: Sampler {
+             + listOfLoras.filter {
+               $0.mode == .all || $0.mode == .refiner
+             }
+-          let fixedEncoder = UNetFixedEncoder<FloatType>(
++          var fixedEncoder = UNetFixedEncoder<FloatType>(
+             filePath: refiner.filePath, version: refiner.version,
+             modifier: modifier, dualAttentionLayers: refiner.dualAttentionLayers,
+             activationQkScaling: refiner.activationQkScaling,
+@@ -413,6 +416,7 @@ extension PLMSSampler: Sampler {
+             isQuantizedModel: refiner.isQuantizedModel, canRunLoRASeparately: canRunLoRASeparately,
+             externalOnDemand: refiner.externalOnDemand, deviceProperties: deviceProperties,
+             weightsCache: weightsCache)
++          fixedEncoder.seamless = seamless
+           if UNetFixedEncoder<FloatType>.isFixedEncoderRequired(version: refiner.version) {
+             conditions = []
+             let vector = fixedEncoder.vector(
+diff --git a/Libraries/SwiftDiffusion/Sources/Samplers/Sampler.swift b/Libraries/SwiftDiffusion/Sources/Samplers/Sampler.swift
+index 7ea4523..b031c38 100644
+--- a/Libraries/SwiftDiffusion/Sources/Samplers/Sampler.swift
++++ b/Libraries/SwiftDiffusion/Sources/Samplers/Sampler.swift
+@@ -267,6 +267,8 @@ public protocol Sampler<FloatType, UNet> {
+   var tiledDiffusion: TiledConfiguration { get }
+   var teaCache: TeaCacheConfiguration { get }
+   var isGuidanceEmbedEnabled: Bool { get }
++  /// Seamless tile for the image RoPE of Krea 2, Z-Image, FLUX.2 and FLUX.3 (nil = off).
++  var seamless: SeamlessTile? { get set }
+ 
+   func sample(
+     _ x_T: DynamicGraph.Tensor<FloatType>, unets: [UNet?], sample: DynamicGraph.Tensor<FloatType>?,
+diff --git a/Libraries/SwiftDiffusion/Sources/Samplers/TCDSampler.swift b/Libraries/SwiftDiffusion/Sources/Samplers/TCDSampler.swift
+index c8fc38a..6b4d13c 100644
+--- a/Libraries/SwiftDiffusion/Sources/Samplers/TCDSampler.swift
++++ b/Libraries/SwiftDiffusion/Sources/Samplers/TCDSampler.swift
+@@ -40,6 +40,8 @@ where UNet.FloatType == FloatType {
+   public let teaCache: TeaCacheConfiguration
+   public let causalInference: (Int, pad: Int)
+   public let isBF16: Bool
++  /// Seamless tile for the image RoPE (Krea 2, Z-Image, FLUX.2, FLUX.3); nil = off.
++  public var seamless: SeamlessTile? = nil
+   private let discretization: Discretization
+   private let weightsCache: WeightsCache
+   public init(
+@@ -209,7 +211,7 @@ extension TCDSampler: Sampler {
+     let result: Result<SamplerOutput<FloatType, UNet>, Error> = graph.withStream(streamContext) {
+       let oldC = c
+       var conditions: [DynamicGraph.AnyTensor] = c
+-      let fixedEncoder = UNetFixedEncoder<FloatType>(
++      var fixedEncoder = UNetFixedEncoder<FloatType>(
+         filePath: filePath, version: version, modifier: modifier,
+         dualAttentionLayers: dualAttentionLayers, activationQkScaling: activationQkScaling,
+         activationProjScaling: activationProjScaling,
+@@ -219,6 +221,7 @@ extension TCDSampler: Sampler {
+         zeroNegativePrompt: zeroNegativePrompt, isQuantizedModel: isQuantizedModel,
+         canRunLoRASeparately: canRunLoRASeparately, externalOnDemand: externalOnDemand,
+         deviceProperties: deviceProperties, weightsCache: weightsCache)
++      fixedEncoder.seamless = seamless
+       let injectedControlsC: [[DynamicGraph.Tensor<FloatType>]]
+       let alphasCumprod = discretization.alphasCumprod(
+         steps: sampling.steps + 1, shift: sampling.shift)
+@@ -429,7 +432,7 @@ extension TCDSampler: Sampler {
+             + listOfLoras.filter {
+               $0.mode == .all || $0.mode == .refiner
+             }
+-          let fixedEncoder = UNetFixedEncoder<FloatType>(
++          var fixedEncoder = UNetFixedEncoder<FloatType>(
+             filePath: refiner.filePath, version: refiner.version,
+             modifier: modifier, dualAttentionLayers: refiner.dualAttentionLayers,
+             activationQkScaling: refiner.activationQkScaling,
+@@ -441,6 +444,7 @@ extension TCDSampler: Sampler {
+             isQuantizedModel: refiner.isQuantizedModel, canRunLoRASeparately: canRunLoRASeparately,
+             externalOnDemand: refiner.externalOnDemand, deviceProperties: deviceProperties,
+             weightsCache: weightsCache)
++          fixedEncoder.seamless = seamless
+           if UNetFixedEncoder<FloatType>.isFixedEncoderRequired(version: refiner.version) {
+             conditions = []
+             let vector = fixedEncoder.vector(
+diff --git a/Libraries/SwiftDiffusion/Sources/Samplers/UniPCSampler.swift b/Libraries/SwiftDiffusion/Sources/Samplers/UniPCSampler.swift
+index 749d25b..36652d5 100644
+--- a/Libraries/SwiftDiffusion/Sources/Samplers/UniPCSampler.swift
++++ b/Libraries/SwiftDiffusion/Sources/Samplers/UniPCSampler.swift
+@@ -41,6 +41,8 @@ where UNet.FloatType == FloatType {
+   public let causalInference: (Int, pad: Int)
+   public let cfgZeroStar: CfgZeroStarConfiguration
+   public let isBF16: Bool
++  /// Seamless tile for the image RoPE (Krea 2, Z-Image, FLUX.2, FLUX.3); nil = off.
++  public var seamless: SeamlessTile? = nil
+   private let discretization: Discretization
+   private let weightsCache: WeightsCache
+   public init(
+@@ -309,7 +311,7 @@ extension UniPCSampler: Sampler {
+     let result: Result<SamplerOutput<FloatType, UNet>, Error> = graph.withStream(streamContext) {
+       let oldC = c
+       var conditions: [DynamicGraph.AnyTensor] = c
+-      let fixedEncoder = UNetFixedEncoder<FloatType>(
++      var fixedEncoder = UNetFixedEncoder<FloatType>(
+         filePath: filePath, version: version, modifier: modifier,
+         dualAttentionLayers: dualAttentionLayers, activationQkScaling: activationQkScaling,
+         activationProjScaling: activationProjScaling,
+@@ -319,6 +321,7 @@ extension UniPCSampler: Sampler {
+         zeroNegativePrompt: zeroNegativePrompt, isQuantizedModel: isQuantizedModel,
+         canRunLoRASeparately: canRunLoRASeparately, externalOnDemand: externalOnDemand,
+         deviceProperties: deviceProperties, weightsCache: weightsCache)
++      fixedEncoder.seamless = seamless
+       let injectedControlsC: [[DynamicGraph.Tensor<FloatType>]]
+       var alphasCumprod = discretization.alphasCumprod(steps: sampling.steps, shift: sampling.shift)
+       if Float(startStep.integral) != startStep.fractional {
+@@ -539,7 +542,7 @@ extension UniPCSampler: Sampler {
+             + listOfLoras.filter {
+               $0.mode == .all || $0.mode == .refiner
+             }
+-          let fixedEncoder = UNetFixedEncoder<FloatType>(
++          var fixedEncoder = UNetFixedEncoder<FloatType>(
+             filePath: refiner.filePath, version: refiner.version,
+             modifier: modifier, dualAttentionLayers: refiner.dualAttentionLayers,
+             activationQkScaling: refiner.activationQkScaling,
+@@ -551,6 +554,7 @@ extension UniPCSampler: Sampler {
+             isQuantizedModel: refiner.isQuantizedModel, canRunLoRASeparately: canRunLoRASeparately,
+             externalOnDemand: refiner.externalOnDemand, deviceProperties: deviceProperties,
+             weightsCache: weightsCache)
++          fixedEncoder.seamless = seamless
+           if UNetFixedEncoder<FloatType>.isFixedEncoderRequired(version: refiner.version) {
+             conditions = []
+             let vector = fixedEncoder.vector(
+diff --git a/Libraries/SwiftDiffusion/Sources/SeamlessTile.swift b/Libraries/SwiftDiffusion/Sources/SeamlessTile.swift
+index 0565e10..19cc2a9 100644
+--- a/Libraries/SwiftDiffusion/Sources/SeamlessTile.swift
++++ b/Libraries/SwiftDiffusion/Sources/SeamlessTile.swift
+@@ -28,9 +28,9 @@ public struct SeamlessTile: Equatable, Sendable {
+   /// not support seamless tiles.
+   public static func minTurns(for version: ModelVersion) -> Double? {
+     switch version {
+-    case .zImage:
++    case .zImage, .krea2:
+       return 1.0
+-    case .krea2, .flux2, .flux2_9b, .flux2_4b, .flux3_5b:
++    case .flux2, .flux2_9b, .flux2_4b, .flux3_5b:
+       return 0.5
+     default:
+       return nil
+-- 
+2.54.0 (Apple Git-157)
+

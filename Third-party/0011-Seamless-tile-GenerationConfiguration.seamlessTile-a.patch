@@ -1,0 +1,390 @@
+From d2ba6012ad41de0318e21dd8cd528162d2aa4a71 Mon Sep 17 00:00:00 2001
+From: Antonio D'Achille <existenz70@gmail.com>
+Date: Wed, 25 Nov 2026 11:44:07 +0100
+Subject: [PATCH 11/17] Seamless tile: GenerationConfiguration.seamlessTile
+ (appended byte) and the torus frequency math
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Apps/SeamlessTileTest/main.swift              | 65 +++++++++++++++++++
+ .../config_data_model_generated.swift         | 11 +++-
+ .../PreGeneratedSPM/config_generated.swift    | 17 ++++-
+ .../config_mutating_generated.swift           |  7 +-
+ .../config_query_generated.swift              | 11 ++++
+ Libraries/DataModels/Sources/config.fbs       |  3 +
+ .../SwiftDiffusion/Sources/SeamlessTile.swift | 55 ++++++++++++++++
+ Package.swift                                 |  9 +++
+ 8 files changed, 173 insertions(+), 5 deletions(-)
+ create mode 100644 Apps/SeamlessTileTest/main.swift
+ create mode 100644 Libraries/SwiftDiffusion/Sources/SeamlessTile.swift
+
+diff --git a/Apps/SeamlessTileTest/main.swift b/Apps/SeamlessTileTest/main.swift
+new file mode 100644
+index 0000000..68566a6
+--- /dev/null
++++ b/Apps/SeamlessTileTest/main.swift
+@@ -0,0 +1,65 @@
++import Diffusion
++import Foundation
++
++func check(_ condition: Bool, _ message: String) {
++  if !condition {
++    print("FAIL: \(message)")
++    exit(1)
++  }
++}
++
++// Configuration values.
++check(SeamlessTile(configurationValue: 0) == nil, "0 is off")
++check(
++  SeamlessTile(configurationValue: 1) == SeamlessTile(wrapsHeight: false, wrapsWidth: true),
++  "1 wraps the width only")
++check(
++  SeamlessTile(configurationValue: 2) == SeamlessTile(wrapsHeight: true, wrapsWidth: false),
++  "2 wraps the height only")
++check(
++  SeamlessTile(configurationValue: 3) == SeamlessTile(wrapsHeight: true, wrapsWidth: true),
++  "3 wraps both")
++check(SeamlessTile(configurationValue: 9) == nil, "an unknown value is off")
++check(SeamlessTile(configurationValue: -1) == nil, "a negative value is off")
++
++// Minimum turns per version.
++check(SeamlessTile.minTurns(for: .zImage) == 1.0, "Z-Image 1.0")
++check(SeamlessTile.minTurns(for: .krea2) == 0.5, "Krea 2 0.5")
++check(SeamlessTile.minTurns(for: .flux2) == 0.5, "FLUX.2 0.5")
++check(SeamlessTile.minTurns(for: .flux2_9b) == 0.5, "FLUX.2 9B 0.5")
++check(SeamlessTile.minTurns(for: .flux2_4b) == 0.5, "FLUX.2 4B 0.5")
++check(SeamlessTile.minTurns(for: .flux3_5b) == 0.5, "FLUX.3 0.5")
++check(SeamlessTile.minTurns(for: .mingImage) == nil, "Ming-Image is not supported")
++check(SeamlessTile.minTurns(for: .flux1) == nil, "FLUX.1 is not supported")
++
++// The angle at one period equals the angle at zero, for every theta and axis size.
++let period = 64.0
++for theta in [256.0, 1000.0, 2000.0, 10000.0] {
++  for dim in [48, 32] {
++    let half = dim / 2
++    for i in 0..<half {
++      let omega = 1.0 / pow(theta, Double(i) / Double(half))
++      for minTurns in [0.5, 1.0] {
++        let end = torusAngle(position: period, omega: omega, period: period, minTurns: minTurns)
++        let start = torusAngle(position: 0, omega: omega, period: period, minTurns: minTurns)
++        check(abs(cos(end) - cos(start)) < 1e-9, "cos wraps (theta \(theta), dim \(dim), i \(i))")
++        check(abs(sin(end) - sin(start)) < 1e-9, "sin wraps (theta \(theta), dim \(dim), i \(i))")
++        // Any position repeats one period later.
++        let a = torusAngle(position: 17, omega: omega, period: period, minTurns: minTurns)
++        let b = torusAngle(position: 17 + period, omega: omega, period: period, minTurns: minTurns)
++        check(abs(cos(a) - cos(b)) < 1e-9 && abs(sin(a) - sin(b)) < 1e-9, "periodic at 17")
++      }
++    }
++  }
++}
++
++// A slow frequency (about 0.10 turns over the period) becomes constant.
++check(
++  torusFrequency(omega: 0.01, period: 64, minTurns: 0.5) == 0, "a slow frequency is zeroed")
++// 2.6 turns over the period snaps to 3 whole turns.
++let omega26 = 2.6 * 2 * Double.pi / 64
++check(
++  abs(torusFrequency(omega: omega26, period: 64, minTurns: 0.5) - 3 * 2 * Double.pi / 64) < 1e-12,
++  "2.6 turns snap to 3")
++
++print("SeamlessTileTest: all passed")
+diff --git a/Libraries/DataModels/PreGeneratedSPM/config_data_model_generated.swift b/Libraries/DataModels/PreGeneratedSPM/config_data_model_generated.swift
+index c85d977..a718941 100755
+--- a/Libraries/DataModels/PreGeneratedSPM/config_data_model_generated.swift
++++ b/Libraries/DataModels/PreGeneratedSPM/config_data_model_generated.swift
+@@ -302,6 +302,7 @@ public final class GenerationConfiguration: Dflat.Atom, SQLiteDflat.SQLiteAtom,
+     guard lhs.solAttentionStart == rhs.solAttentionStart else { return false }
+     guard lhs.solAttentionTau == rhs.solAttentionTau else { return false }
+     guard lhs.scheduler == rhs.scheduler else { return false }
++    guard lhs.seamlessTile == rhs.seamlessTile else { return false }
+     return true
+   }
+   public var _rowid: Int64 = -1
+@@ -397,6 +398,7 @@ public final class GenerationConfiguration: Dflat.Atom, SQLiteDflat.SQLiteAtom,
+   public let solAttentionStart: Int32
+   public let solAttentionTau: Float32
+   public let scheduler: Int32
++  public let seamlessTile: Int8
+   public init(
+     id: Int64, startWidth: UInt16? = 0, startHeight: UInt16? = 0, seed: UInt32? = 0,
+     steps: UInt32? = 0, guidanceScale: Float32? = 0.0, strength: Float32? = 0.0,
+@@ -432,7 +434,7 @@ public final class GenerationConfiguration: Dflat.Atom, SQLiteDflat.SQLiteAtom,
+     compressionArtifactsQuality: Float32? = 43.1, colorCalibration: ColorCalibration? = .disabled,
+     expandPromptToJson: Bool? = false, shiftForAudio: Float32? = 3.0,
+     usesSolAttention: Bool? = false, solAttentionStart: Int32? = 2, solAttentionTau: Float32? = 0.5,
+-    scheduler: Int32? = 0
++    scheduler: Int32? = 0, seamlessTile: Int8? = 0
+   ) {
+     self.id = id
+     self.startWidth = startWidth ?? 0
+@@ -525,6 +527,7 @@ public final class GenerationConfiguration: Dflat.Atom, SQLiteDflat.SQLiteAtom,
+     self.solAttentionStart = solAttentionStart ?? 2
+     self.solAttentionTau = solAttentionTau ?? 0.5
+     self.scheduler = scheduler ?? 0
++    self.seamlessTile = seamlessTile ?? 0
+   }
+   public init(_ obj: zzz_DflatGen_GenerationConfiguration) {
+     self.id = obj.id
+@@ -629,6 +632,7 @@ public final class GenerationConfiguration: Dflat.Atom, SQLiteDflat.SQLiteAtom,
+     self.solAttentionStart = obj.solAttentionStart
+     self.solAttentionTau = obj.solAttentionTau
+     self.scheduler = obj.scheduler
++    self.seamlessTile = obj.seamlessTile
+   }
+   public static func from(data: Data) -> Self {
+     return data.withUnsafeBytes { buffer in
+@@ -793,6 +797,7 @@ public struct GenerationConfigurationBuilder {
+   public var solAttentionStart: Int32
+   public var solAttentionTau: Float32
+   public var scheduler: Int32
++  public var seamlessTile: Int8
+   public init(from object: GenerationConfiguration) {
+     id = object.id
+     startWidth = object.startWidth
+@@ -885,6 +890,7 @@ public struct GenerationConfigurationBuilder {
+     solAttentionStart = object.solAttentionStart
+     solAttentionTau = object.solAttentionTau
+     scheduler = object.scheduler
++    seamlessTile = object.seamlessTile
+   }
+   public func build() -> GenerationConfiguration {
+     GenerationConfiguration(
+@@ -924,7 +930,8 @@ public struct GenerationConfigurationBuilder {
+       compressionArtifactsQuality: compressionArtifactsQuality, colorCalibration: colorCalibration,
+       expandPromptToJson: expandPromptToJson, shiftForAudio: shiftForAudio,
+       usesSolAttention: usesSolAttention, solAttentionStart: solAttentionStart,
+-      solAttentionTau: solAttentionTau, scheduler: scheduler)
++      solAttentionTau: solAttentionTau, scheduler: scheduler,
++      seamlessTile: seamlessTile)
+   }
+ }
+ 
+diff --git a/Libraries/DataModels/PreGeneratedSPM/config_generated.swift b/Libraries/DataModels/PreGeneratedSPM/config_generated.swift
+index 9d21480..670a3d5 100755
+--- a/Libraries/DataModels/PreGeneratedSPM/config_generated.swift
++++ b/Libraries/DataModels/PreGeneratedSPM/config_generated.swift
+@@ -500,6 +500,7 @@ public struct zzz_DflatGen_GenerationConfiguration: FlatBufferObject, Verifiable
+     case solAttentionStart = 184
+     case solAttentionTau = 186
+     case scheduler = 188
++    case seamlessTile = 190
+     var v: Int32 { Int32(self.rawValue) }
+     var p: VOffset { self.rawValue }
+   }
+@@ -916,8 +917,12 @@ public struct zzz_DflatGen_GenerationConfiguration: FlatBufferObject, Verifiable
+     let o = _accessor.offset(VTOFFSET.scheduler.v)
+     return o == 0 ? 0 : _accessor.readBuffer(of: Int32.self, at: o)
+   }
++  public var seamlessTile: Int8 {
++    let o = _accessor.offset(VTOFFSET.seamlessTile.v)
++    return o == 0 ? 0 : _accessor.readBuffer(of: Int8.self, at: o)
++  }
+   public static func startGenerationConfiguration(_ fbb: inout FlatBufferBuilder) -> UOffset {
+-    fbb.startTable(with: 93)
++    fbb.startTable(with: 94)
+   }
+   public static func add(id: Int64, _ fbb: inout FlatBufferBuilder) {
+     fbb.add(element: id, def: 0, at: VTOFFSET.id.p)
+@@ -1228,6 +1233,9 @@ public struct zzz_DflatGen_GenerationConfiguration: FlatBufferObject, Verifiable
+   public static func add(scheduler: Int32, _ fbb: inout FlatBufferBuilder) {
+     fbb.add(element: scheduler, def: 0, at: VTOFFSET.scheduler.p)
+   }
++  public static func add(seamlessTile: Int8, _ fbb: inout FlatBufferBuilder) {
++    fbb.add(element: seamlessTile, def: 0, at: VTOFFSET.seamlessTile.p)
++  }
+   public static func endGenerationConfiguration(_ fbb: inout FlatBufferBuilder, start: UOffset)
+     -> Offset
+   {
+@@ -1326,7 +1334,8 @@ public struct zzz_DflatGen_GenerationConfiguration: FlatBufferObject, Verifiable
+     usesSolAttention: Bool = false,
+     solAttentionStart: Int32 = 2,
+     solAttentionTau: Float32 = 0.5,
+-    scheduler: Int32 = 0
++    scheduler: Int32 = 0,
++    seamlessTile: Int8 = 0
+   ) -> Offset {
+     let __start = zzz_DflatGen_GenerationConfiguration.startGenerationConfiguration(&fbb)
+     zzz_DflatGen_GenerationConfiguration.add(id: id, &fbb)
+@@ -1427,6 +1436,7 @@ public struct zzz_DflatGen_GenerationConfiguration: FlatBufferObject, Verifiable
+     zzz_DflatGen_GenerationConfiguration.add(solAttentionStart: solAttentionStart, &fbb)
+     zzz_DflatGen_GenerationConfiguration.add(solAttentionTau: solAttentionTau, &fbb)
+     zzz_DflatGen_GenerationConfiguration.add(scheduler: scheduler, &fbb)
++    zzz_DflatGen_GenerationConfiguration.add(seamlessTile: seamlessTile, &fbb)
+     return zzz_DflatGen_GenerationConfiguration.endGenerationConfiguration(&fbb, start: __start)
+   }
+ 
+@@ -1670,6 +1680,9 @@ public struct zzz_DflatGen_GenerationConfiguration: FlatBufferObject, Verifiable
+     try _v.visit(
+       field: VTOFFSET.scheduler.p, fieldName: "scheduler", required: false,
+       type: Int32.self)
++    try _v.visit(
++      field: VTOFFSET.seamlessTile.p, fieldName: "seamlessTile", required: false,
++      type: Int8.self)
+     _v.finish()
+   }
+ }
+diff --git a/Libraries/DataModels/PreGeneratedSPM/config_mutating_generated.swift b/Libraries/DataModels/PreGeneratedSPM/config_mutating_generated.swift
+index 7899926..331f5c9 100755
+--- a/Libraries/DataModels/PreGeneratedSPM/config_mutating_generated.swift
++++ b/Libraries/DataModels/PreGeneratedSPM/config_mutating_generated.swift
+@@ -265,6 +265,7 @@ extension GenerationConfiguration: FlatBuffersEncodable {
+     zzz_DflatGen_GenerationConfiguration.add(
+       solAttentionTau: self.solAttentionTau, &flatBufferBuilder)
+     zzz_DflatGen_GenerationConfiguration.add(scheduler: self.scheduler, &flatBufferBuilder)
++    zzz_DflatGen_GenerationConfiguration.add(seamlessTile: self.seamlessTile, &flatBufferBuilder)
+     return zzz_DflatGen_GenerationConfiguration.endGenerationConfiguration(
+       &flatBufferBuilder, start: start)
+   }
+@@ -383,6 +384,7 @@ public final class GenerationConfigurationChangeRequest: Dflat.ChangeRequest {
+   public var solAttentionStart: Int32
+   public var solAttentionTau: Float32
+   public var scheduler: Int32
++  public var seamlessTile: Int8
+   private init(type _type: ChangeRequestType) {
+     _o = nil
+     self._type = _type
+@@ -478,6 +480,7 @@ public final class GenerationConfigurationChangeRequest: Dflat.ChangeRequest {
+     solAttentionStart = 2
+     solAttentionTau = 0.5
+     scheduler = 0
++    seamlessTile = 0
+   }
+   private init(type _type: ChangeRequestType, _ _o: GenerationConfiguration) {
+     self._o = _o
+@@ -574,6 +577,7 @@ public final class GenerationConfigurationChangeRequest: Dflat.ChangeRequest {
+     solAttentionStart = _o.solAttentionStart
+     solAttentionTau = _o.solAttentionTau
+     scheduler = _o.scheduler
++    seamlessTile = _o.seamlessTile
+   }
+   public static func changeRequest(_ o: GenerationConfiguration)
+     -> GenerationConfigurationChangeRequest?
+@@ -657,7 +661,8 @@ public final class GenerationConfigurationChangeRequest: Dflat.ChangeRequest {
+       compressionArtifactsQuality: compressionArtifactsQuality, colorCalibration: colorCalibration,
+       expandPromptToJson: expandPromptToJson, shiftForAudio: shiftForAudio,
+       usesSolAttention: usesSolAttention, solAttentionStart: solAttentionStart,
+-      solAttentionTau: solAttentionTau, scheduler: scheduler)
++      solAttentionTau: solAttentionTau, scheduler: scheduler,
++      seamlessTile: seamlessTile)
+     atom._rowid = _rowid
+     return atom
+   }
+diff --git a/Libraries/DataModels/PreGeneratedSPM/config_query_generated.swift b/Libraries/DataModels/PreGeneratedSPM/config_query_generated.swift
+index 912028d..86614fc 100755
+--- a/Libraries/DataModels/PreGeneratedSPM/config_query_generated.swift
++++ b/Libraries/DataModels/PreGeneratedSPM/config_query_generated.swift
+@@ -964,4 +964,15 @@ extension GenerationConfiguration {
+   public static let scheduler: FieldExpr<Int32, GenerationConfiguration> = FieldExpr(
+     name: "f188", primaryKey: false, hasIndex: false, tableReader: _tr__f188,
+     objectReader: _or__f188)
++
++  private static func _tr__f190(_ table: ByteBuffer) -> Int8? {
++    let tr0 = zzz_DflatGen_GenerationConfiguration.getRootAsGenerationConfiguration(bb: table)
++    return tr0.seamlessTile
++  }
++  private static func _or__f190(_ or0: GenerationConfiguration) -> Int8? {
++    return or0.seamlessTile
++  }
++  public static let seamlessTile: FieldExpr<Int8, GenerationConfiguration> = FieldExpr(
++    name: "f190", primaryKey: false, hasIndex: false, tableReader: _tr__f190,
++    objectReader: _or__f190)
+ }
+diff --git a/Libraries/DataModels/Sources/config.fbs b/Libraries/DataModels/Sources/config.fbs
+index 7f32596..81296dc 100644
+--- a/Libraries/DataModels/Sources/config.fbs
++++ b/Libraries/DataModels/Sources/config.fbs
+@@ -196,6 +196,9 @@ table GenerationConfiguration {
+   // Atelier's ComfyUI scheduler, appended so readers that don't know it see 0 (the sampler's own).
+   // 0 default, 1 simple, 2 sgm_uniform, 3 normal, 4 karras, 5 exponential, 6 linear_quadratic, 7 beta.
+   scheduler: int = 0;
++  // Seamless tile (DT Hub), appended so readers that don't know it see 0 (off).
++  // 0 off, 1 left-right, 2 up-down, 3 both.
++  seamless_tile: byte = 0;
+ }
+ 
+ root_type GenerationConfiguration;
+diff --git a/Libraries/SwiftDiffusion/Sources/SeamlessTile.swift b/Libraries/SwiftDiffusion/Sources/SeamlessTile.swift
+new file mode 100644
+index 0000000..30239e9
+--- /dev/null
++++ b/Libraries/SwiftDiffusion/Sources/SeamlessTile.swift
+@@ -0,0 +1,55 @@
++import Foundation
++
++/// Seamless tile: the image repeats with no edge along the axes it wraps. The request carries it as
++/// `GenerationConfiguration.seamlessTile` (0 off, 1 left-right, 2 up-down, 3 both).
++public struct SeamlessTile: Equatable, Sendable {
++  public var wrapsHeight: Bool
++  public var wrapsWidth: Bool
++
++  public init(wrapsHeight: Bool, wrapsWidth: Bool) {
++    self.wrapsHeight = wrapsHeight
++    self.wrapsWidth = wrapsWidth
++  }
++
++  /// nil for 0 (off) and for a value this build doesn't know; 1 wraps the width only, 2 the height
++  /// only, 3 both.
++  public init?(configurationValue: Int8) {
++    switch configurationValue {
++    case 1: self.init(wrapsHeight: false, wrapsWidth: true)
++    case 2: self.init(wrapsHeight: true, wrapsWidth: false)
++    case 3: self.init(wrapsHeight: true, wrapsWidth: true)
++    default: return nil
++    }
++  }
++
++  /// The smallest number of turns a RoPE frequency makes over the tile period and still gets
++  /// snapped to a whole number of turns (slower ones become constant); nil when the version does
++  /// not support seamless tiles.
++  public static func minTurns(for version: ModelVersion) -> Double? {
++    switch version {
++    case .zImage:
++      return 1.0
++    case .krea2, .flux2, .flux2_9b, .flux2_4b, .flux3_5b:
++      return 0.5
++    default:
++      return nil
++    }
++  }
++}
++
++/// A RoPE frequency snapped to whole turns over `period`: `turns = round(ω·P/2π)`, or 0 when
++/// `ω·P/2π < minTurns`; the result is `turns·2π/P`. All in `Double`.
++public func torusFrequency(omega: Double, period: Double, minTurns: Double) -> Double {
++  let turns = omega * period / (2 * Double.pi)
++  guard turns >= minTurns else { return 0 }
++  return turns.rounded() * 2 * Double.pi / period
++}
++
++/// The RoPE angle of `position` on the torus: the position is taken modulo `period`, so
++/// `position` and `position + period` give the same angle (as a point on the circle).
++public func torusAngle(position: Double, omega: Double, period: Double, minTurns: Double) -> Double
++{
++  var wrapped = position.truncatingRemainder(dividingBy: period)
++  if wrapped < 0 { wrapped += period }
++  return wrapped * torusFrequency(omega: omega, period: period, minTurns: minTurns)
++}
+diff --git a/Package.swift b/Package.swift
+index 003485f..b4c20c6 100644
+--- a/Package.swift
++++ b/Package.swift
+@@ -512,6 +512,15 @@ let package = Package(
+       path: "Apps/MingVAETest",
+       sources: ["main.swift"]
+     ),
++    .executableTarget(
++      name: "SeamlessTileTest",
++      dependencies: [
++        "Diffusion",
++        .product(name: "NNC", package: "s4nnc"),
++      ],
++      path: "Apps/SeamlessTileTest",
++      sources: ["main.swift"]
++    ),
+     .executableTarget(
+       name: "MingDiTTest",
+       dependencies: [
+-- 
+2.54.0 (Apple Git-157)
+

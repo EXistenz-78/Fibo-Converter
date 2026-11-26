@@ -1,0 +1,144 @@
+From 199c0ead7f6a649fd36d5b0c3d51e99db6963893 Mon Sep 17 00:00:00 2001
+From: Antonio D'Achille <existenz70@gmail.com>
+Date: Wed, 25 Nov 2026 11:50:48 +0100
+Subject: [PATCH 13/17] Seamless tile: UNetFixedEncoder.seamless reaches the
+ image RoPE of the four families (never Ming)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Apps/SeamlessTileTest/check-call-sites.sh     | 58 +++++++++++++++++++
+ .../Sources/UNetFixedEncoder.swift            | 14 +++--
+ 2 files changed, 66 insertions(+), 6 deletions(-)
+ create mode 100755 Apps/SeamlessTileTest/check-call-sites.sh
+
+diff --git a/Apps/SeamlessTileTest/check-call-sites.sh b/Apps/SeamlessTileTest/check-call-sites.sh
+new file mode 100755
+index 0000000..8047ffe
+--- /dev/null
++++ b/Apps/SeamlessTileTest/check-call-sites.sh
+@@ -0,0 +1,58 @@
++#!/bin/bash
++# Static check: the seamless flag reaches the image-grid RoPE calls of the four families
++# in UNetFixedEncoder.swift, and never the Ming-Image branch (it shares ZImageRotaryPositionEmbedding).
++set -u
++root="$(cd "$(dirname "$0")/../.." && pwd)"
++src="$root/Libraries/SwiftDiffusion/Sources/UNetFixedEncoder.swift"
++fail=0
++bad() { echo "FAIL: $1"; fail=1; }
++
++[ -f "$src" ] || { echo "FAIL: missing $src"; exit 1; }
++
++grep -q 'public var seamless: SeamlessTile? = nil' "$src" || bad "UNetFixedEncoder.seamless property missing"
++
++total=$(grep -c 'seamless: seamless' "$src")
++[ "$total" -eq 6 ] || bad "expected 6 occurrences of 'seamless: seamless', found $total"
++
++# Extent of a top-level `case` branch: from its line to the next 4-space-indented `case`/`default`.
++branch() {
++  awk -v pat="$1" '
++    $0 ~ "^    case " pat { on = 1; print; next }
++    on && /^    (case |default)/ { exit }
++    on { print }' "$src"
++}
++
++ming=$(branch '\\.mingImage:')
++[ -n "$ming" ] || bad "case .mingImage branch not found"
++echo "$ming" | grep -q 'ZImageRotaryPositionEmbedding(' || bad "mingImage branch lost its ZImage RoPE call (check script out of date)"
++echo "$ming" | grep -q 'seamless:' && bad "seamless: appears in the .mingImage branch"
++
++# Count calls whose argument list (up to the closing paren line) contains `seamless: seamless`.
++count_calls() { # $1 = text, $2 = type name, $3 = required marker (grep -E)
++  echo "$1" | awk -v t="$2" -v m="$3" '
++    index($0, t "(") { buf = $0; open = 1; next_line = 0 }
++    open && !index($0, t "(") { buf = buf "\n" $0 }
++    open && /\)[ ]*$|\)\)[ ]*$|\)\.toGPU/ { if (buf ~ m) good++; else other++; open = 0 }
++    END { print good + 0 }'
++}
++
++krea=$(count_calls "$(grep -n '' "$src" | sed 's/^[0-9]*://')" 'Krea2RotaryPositionEmbedding' 'seamless: seamless')
++[ "$krea" -eq 1 ] || bad "Krea 2: expected 1 call with seamless: seamless, found $krea"
++
++zi=$(branch '\\.zImage:')
++zcalls=$(count_calls "$zi" 'ZImageRotaryPositionEmbedding' 'height: h, width: w(.|\n)*seamless: seamless')
++[ "$zcalls" -eq 3 ] || bad "Z-Image: expected 3 image-grid calls with seamless: seamless, found $zcalls"
++# The text-only calls (height: 0) must not carry the flag.
++echo "$zi" | grep -A2 'height: 0, width: 0' | grep -q 'seamless:' && bad "Z-Image text-only call (height: 0) carries seamless:"
++
++f3=$(branch '\\.flux3_5b:')
++f3calls=$(count_calls "$f3" 'Flux3RotaryPositionEmbedding' 'height: h, width: w(.|\n)*seamless: seamless')
++[ "$f3calls" -eq 1 ] || bad "FLUX.3: expected 1 call with seamless: seamless, found $f3calls"
++
++f2=$(branch '\\.flux2, \\.flux2_9b, \\.flux2_4b:')
++f2calls=$(count_calls "$f2" 'Flux2RotaryPositionEmbedding' 'height: h, width: w(.|\n)*seamless: seamless')
++[ "$f2calls" -eq 1 ] || bad "FLUX.2: expected 1 call with seamless: seamless, found $f2calls"
++echo "$f2" | grep -A2 'height: 0, width: 0' | grep -q 'seamless:' && bad "FLUX.2 text-only call (height: 0) carries seamless:"
++
++if [ "$fail" -eq 0 ]; then echo "OK: seamless reaches Krea2 x1, Z-Image x3, FLUX.3 x1, FLUX.2 x1; never Ming"; fi
++exit $fail
+diff --git a/Libraries/SwiftDiffusion/Sources/UNetFixedEncoder.swift b/Libraries/SwiftDiffusion/Sources/UNetFixedEncoder.swift
+index 9d8c87c..f931848 100644
+--- a/Libraries/SwiftDiffusion/Sources/UNetFixedEncoder.swift
++++ b/Libraries/SwiftDiffusion/Sources/UNetFixedEncoder.swift
+@@ -20,6 +20,8 @@ public struct UNetFixedEncoder<FloatType: TensorNumeric & BinaryFloatingPoint> {
+   public let externalOnDemand: Bool
+   public let deviceProperties: DeviceProperties
+   private let weightsCache: WeightsCache
++  /// Seamless tiling for the image grid of Krea 2, Z-Image, FLUX.2 and FLUX.3 (nil = off).
++  public var seamless: SeamlessTile? = nil
+   public init(
+     filePath: String, version: ModelVersion, modifier: SamplerModifier, dualAttentionLayers: [Int],
+     activationQkScaling: [Int: Int], activationProjScaling: [Int: Int],
+@@ -889,7 +891,7 @@ extension UNetFixedEncoder {
+       let rotary = graph.variable(
+         Krea2RotaryPositionEmbedding(
+           textLength: maxTextLength, gridHeight: h, gridWidth: w,
+-          referenceCount: krea2References.count, of: FloatType.self
++          referenceCount: krea2References.count, of: FloatType.self, seamless: seamless
+         ).toGPU(0))
+       precondition(fixedConditions.count == 1 + 6 + 1)
+       let conditions: [DynamicGraph.AnyTensor] =
+@@ -2886,12 +2888,12 @@ extension UNetFixedEncoder {
+         let rotaryEmbeddingUncond = Tensor<FloatType>(
+           from: ZImageRotaryPositionEmbedding(
+             height: h, width: w, tokenLength: roundUpTokenLengthUncond,
+-            imagePaddedLength: imagePaddedLength)
++            imagePaddedLength: imagePaddedLength, seamless: seamless)
+         ).toGPU(0)
+         let rotaryEmbeddingCond = Tensor<FloatType>(
+           from: ZImageRotaryPositionEmbedding(
+             height: h, width: w, tokenLength: roundUpTokenLengthCond,
+-            imagePaddedLength: imagePaddedLength)
++            imagePaddedLength: imagePaddedLength, seamless: seamless)
+         ).toGPU(0)
+         rotaryEmbeddings = [
+           graph.variable(rotaryEmbeddingUncond), graph.variable(rotaryEmbeddingCond),
+@@ -2900,7 +2902,7 @@ extension UNetFixedEncoder {
+         let rotaryEmbedding = Tensor<FloatType>(
+           from: ZImageRotaryPositionEmbedding(
+             height: h, width: w, tokenLength: roundUpTokenLengthCond,
+-            imagePaddedLength: imagePaddedLength)
++            imagePaddedLength: imagePaddedLength, seamless: seamless)
+         ).toGPU(0)
+         let rot = graph.variable(rotaryEmbedding)
+         rotaryEmbeddings = [rot, rot]
+@@ -3485,7 +3487,7 @@ extension UNetFixedEncoder {
+         from: Flux3RotaryPositionEmbedding(
+           height: h, width: w, tokenLength: textLength,
+           referenceSizes: referenceSizes.map { (height: $0.height / 2, width: $0.width / 2) },
+-          channels: 128)
++          channels: 128, seamless: seamless)
+       ).toGPU(0)
+       return ([graph.variable(rotaryEmbedding)] + conditions, nil)
+     case .flux2, .flux2_9b, .flux2_4b:
+@@ -3700,7 +3702,7 @@ extension UNetFixedEncoder {
+       let rotaryEmbedding = Tensor<FloatType>(
+         from: Flux2RotaryPositionEmbedding(
+           height: h, width: w, tokenLength: textLength, referenceSizes: referenceSizes,
+-          channels: 128)
++          channels: 128, seamless: seamless)
+       ).toGPU(0)
+       return ([graph.variable(rotaryEmbedding)] + conditions, nil)
+     case .cosmos2_5_2b, .cosmos2_5_2_9b:
+-- 
+2.54.0 (Apple Git-157)
+

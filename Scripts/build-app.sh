@@ -1,9 +1,9 @@
 #!/bin/bash
 # Builds "Model Converter.app" in build/. The conversion tools come from the Draw Things fork
-# (branch ming-image, see README): FORK=/path/to/fork builds them if they are missing.
+# (branch dthub-engine, see README): FORK=/path/to/fork builds them if they are missing.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-FORK="${FORK:-$HOME/Developer-krea2/fork-f4d03b02}"
+FORK="${FORK:-$HOME/Software developement/DT Hub/Developer-krea2/fork-ming-layer}"
 APP="build/Model Converter.app"
 
 for tool in ModelConverter QuantI8x; do
@@ -25,7 +25,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <key>CFBundleIdentifier</key><string>com.exiztenz.fibo-converter</string>
 <key>CFBundleName</key><string>Model Converter</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.3</string>
+<key>CFBundleShortVersionString</key><string>1.4</string>
 <key>CFBundleVersion</key><string>1</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSHighResolutionCapable</key><true/>

@@ -1,0 +1,487 @@
+From 4155f44f7b75ef6e8b888b410f5c42fb885454e1 Mon Sep 17 00:00:00 2001
+From: Antonio D'Achille <existenz70@gmail.com>
+Date: Wed, 25 Nov 2026 11:59:22 +0100
+Subject: [PATCH 14/17] Seamless tile: wrap padding in the Decoder (Z-Image,
+ FLUX.2, FLUX.3; nil builds today's graph)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Apps/SeamlessTileTest/main.swift              | 213 ++++++++++++++++++
+ .../Sources/Models/Autoencoder.swift          |  65 ++++--
+ .../SwiftDiffusion/Sources/SeamlessTile.swift |  78 +++++++
+ 3 files changed, 332 insertions(+), 24 deletions(-)
+
+diff --git a/Apps/SeamlessTileTest/main.swift b/Apps/SeamlessTileTest/main.swift
+index 3fb839d..bbd9ed4 100644
+--- a/Apps/SeamlessTileTest/main.swift
++++ b/Apps/SeamlessTileTest/main.swift
+@@ -299,6 +299,219 @@ do {
+   checkTorus(layout, off: f3(nil), both: f3(both), widthOnly: f3(widthOnly))
+ }
+ 
++// MARK: Wrap padding in the VAE decoder.
++
++let wrapGraph = DynamicGraph()
++
++// The graphs run on the GPU: the CPU reference convolution does not take OIHW weights with NHWC
++// inputs, which is what the decoder uses.
++func runModel(_ model: Model, _ input: Tensor<Float>) -> Tensor<Float> {
++  return wrapGraph.withNoGrad {
++    let x = wrapGraph.variable(input.toGPU(0))
++    return model(inputs: x)[0].as(of: Float.self).rawValue.toCPU()
++  }
++}
++
++func randomTensor(_ shape: [Int]) -> Tensor<Float> {
++  var t = Tensor<Float>(.CPU, .NHWC(shape[0], shape[1], shape[2], shape[3]))
++  for n in 0..<shape[0] {
++    for y in 0..<shape[1] {
++      for x in 0..<shape[2] {
++        for c in 0..<shape[3] { t[n, y, x, c] = Float.random(in: -1...1) }
++      }
++    }
++  }
++  return t
++}
++
++/// The input repeated `rows` times down and `columns` times across (NHWC).
++func tiled(_ t: Tensor<Float>, rows: Int, columns: Int) -> Tensor<Float> {
++  let (n, h, w, c) = (t.shape[0], t.shape[1], t.shape[2], t.shape[3])
++  var out = Tensor<Float>(.CPU, .NHWC(n, h * rows, w * columns, c))
++  for b in 0..<n {
++    for y in 0..<(h * rows) {
++      for x in 0..<(w * columns) {
++        for k in 0..<c { out[b, y, x, k] = t[b, y % h, x % w, k] }
++      }
++    }
++  }
++  return out
++}
++
++/// The largest absolute difference between `a` and the window of `b` at (`top`, `left`).
++func maxDifference(_ a: Tensor<Float>, _ b: Tensor<Float>, top: Int, left: Int) -> Float {
++  var worst: Float = 0
++  for n in 0..<a.shape[0] {
++    for y in 0..<a.shape[1] {
++      for x in 0..<a.shape[2] {
++        for c in 0..<a.shape[3] {
++          worst = max(worst, abs(a[n, y, x, c] - b[n, y + top, x + left, c]))
++        }
++      }
++    }
++  }
++  return worst
++}
++
++// WrapPad on a known 1x4x5x1 tensor: the opposite edges come around.
++do {
++  var known = Tensor<Float>(.CPU, .NHWC(1, 4, 5, 1))
++  for y in 0..<4 {
++    for x in 0..<5 { known[0, y, x, 0] = Float(y * 10 + x) }
++  }
++  let both = runModel(
++    WrapPad(
++      batchSize: 1, height: 4, width: 5, channels: 1, top: 1, left: 1, wrapsHeight: true,
++      wrapsWidth: true), known)
++  check(both.shape[1] == 6 && both.shape[2] == 7, "WrapPad both gives 1x6x7x1")
++  for y in 0..<6 {
++    for x in 0..<7 {
++      let expected = Float(((y + 3) % 4) * 10 + (x + 4) % 5)
++      check(both[0, y, x, 0] == expected, "WrapPad both at \(y), \(x)")
++    }
++  }
++  let heightOnly = runModel(
++    WrapPad(
++      batchSize: 1, height: 4, width: 5, channels: 1, top: 1, left: 1, wrapsHeight: true,
++      wrapsWidth: false), known)
++  check(heightOnly.shape[1] == 6 && heightOnly.shape[2] == 5, "WrapPad height gives 1x6x5x1")
++  for y in 0..<6 {
++    for x in 0..<5 {
++      check(
++        heightOnly[0, y, x, 0] == Float(((y + 3) % 4) * 10 + x), "WrapPad height at \(y), \(x)")
++    }
++  }
++}
++
++// A wrapping 3x3 convolution equals the same convolution on the 3x3 tile, cropped to the center.
++// The other axis keeps its zero border.
++do {
++  let input = randomTensor([1, 8, 8, 4])
++  var weight = Tensor<Float>(.CPU, .NCHW(3, 4, 3, 3))
++  for o in 0..<3 {
++    for i in 0..<4 {
++      for y in 0..<3 {
++        for x in 0..<3 { weight[o, i, y, x] = Float.random(in: -1...1) }
++      }
++    }
++  }
++  var bias = Tensor<Float>(.CPU, .C(3))
++  for o in 0..<3 { bias[o] = Float.random(in: -1...1) }
++  let border = Hint.Border(begin: [1, 1], end: [1, 1])
++  for (value, rows, columns) in [(Int8(3), 3, 3), (Int8(2), 3, 1), (Int8(1), 1, 3)] {
++    let wrap = SeamlessTile(configurationValue: value)!
++    let (conv, apply) = WrappingConvolution(
++      groups: 1, filters: 3, filterSize: [3, 3], border: border, wrap: wrap,
++      inputShape: (batchSize: 1, height: 8, width: 8, channels: 4), format: .OIHW)
++    let x = Input()
++    let wrapping = Model([x], [apply(x)])
++    wrapGraph.withNoGrad {
++      wrapping.compile(inputs: wrapGraph.variable(input.toGPU(0)))
++    }
++    conv.weight.copy(from: weight)
++    conv.bias.copy(from: bias)
++    let reference = Convolution(
++      groups: 1, filters: 3, filterSize: [3, 3], hint: Hint(stride: [1, 1], border: border),
++      format: .OIHW)
++    let tile = tiled(input, rows: rows, columns: columns)
++    wrapGraph.withNoGrad {
++      reference.compile(inputs: wrapGraph.variable(tile.toGPU(0)))
++    }
++    reference.weight.copy(from: weight)
++    reference.bias.copy(from: bias)
++    let out = runModel(wrapping, input)
++    let expected = runModel(reference, tile)
++    check(out.shape[1] == 8 && out.shape[2] == 8, "wrapping conv \(value) keeps 8x8")
++    let difference = maxDifference(
++      out, expected, top: rows == 3 ? 8 : 0, left: columns == 3 ? 8 : 0)
++    check(difference < 1e-4, "wrapping conv \(value) matches the tile (\(difference))")
++  }
++}
++
++/// The input moved by `dy` rows and `dx` columns, wrapping around (NHWC).
++func rolled(_ t: Tensor<Float>, _ dy: Int, _ dx: Int) -> Tensor<Float> {
++  let (n, h, w, c) = (t.shape[0], t.shape[1], t.shape[2], t.shape[3])
++  var out = Tensor<Float>(.CPU, .NHWC(n, h, w, c))
++  for b in 0..<n {
++    for y in 0..<h {
++      for x in 0..<w {
++        for k in 0..<c { out[b, (y + dy) % h, (x + dx) % w, k] = t[b, y, x, k] }
++      }
++    }
++  }
++  return out
++}
++
++// The Decoder with wrap reads the same weights as without (same parameter names, the plain one
++// reads the wrapping one's file strictly). A wrapping decoder commutes with a circular shift on
++// its wrapped axes: group norm and attention don't see positions and every padded convolution
++// is circular, so moving the latent by (1, 1) moves the picture by (2, 2) with one upsampling.
++// The plain decoder does not (its zero borders break the shift), which shows the check bites.
++// (Comparing with the plain decoder on a tiled latent can't work: the mid attention is global
++// and the receptive field is wider than one tile.)
++func decoderKeys(_ model: Model, _ path: String) -> [String] {
++  var keys = [String]()
++  wrapGraph.openStore(path) { store in
++    store.write("decoder", model: model)
++    keys = store.keys.sorted()
++  }
++  return keys
++}
++for (specializingNames, value) in [(false, Int8(3)), (true, Int8(3)), (true, Int8(1))] {
++  let wrap = SeamlessTile(configurationValue: value)!
++  func makeDecoder(wrap: SeamlessTile?) -> Model {
++    return Decoder(
++      channels: [32, 32], numRepeat: 1, batchSize: 1, startWidth: 4, startHeight: 4,
++      inputChannels: 16, highPrecisionKeysAndValues: false, usesFlashAttention: false,
++      paddingFinalConvLayer: true, format: .NHWC, quantLayer: true,
++      specializingNames: specializingNames, wrap: wrap
++    ).0
++  }
++  let latent = randomTensor([1, 4, 4, 16])
++  let dy = wrap.wrapsHeight ? 1 : 0
++  let dx = wrap.wrapsWidth ? 1 : 0
++  let wrapping = makeDecoder(wrap: wrap)
++  let plain = makeDecoder(wrap: nil)
++  // The parameters exist once a model has run.
++  let out = runModel(wrapping, latent)
++  _ = runModel(plain, latent)
++  let directory = FileManager.default.temporaryDirectory
++  let wrapPath = directory.appendingPathComponent("seamless-\(UUID().uuidString).ckpt").path
++  let plainPath = directory.appendingPathComponent("seamless-\(UUID().uuidString).ckpt").path
++  defer {
++    try? FileManager.default.removeItem(atPath: wrapPath)
++    try? FileManager.default.removeItem(atPath: plainPath)
++  }
++  let wrapKeys = decoderKeys(wrapping, wrapPath)
++  let plainKeys = decoderKeys(plain, plainPath)
++  check(
++    !wrapKeys.isEmpty && wrapKeys == plainKeys,
++    "Decoder parameter names (specializingNames \(specializingNames)) are the same with wrap")
++  var readError: Error? = nil
++  wrapGraph.openStore(wrapPath, flags: .readOnly) { store in
++    do {
++      try store.read("decoder", model: plain, strict: true)
++    } catch {
++      readError = error
++    }
++  }
++  check(readError == nil, "the plain Decoder reads the wrapping Decoder's weights")
++  check(out.shape[1] == 8 && out.shape[2] == 8 && out.shape[3] == 4, "Decoder output 1x8x8x4")
++  let shifted = runModel(wrapping, rolled(latent, dy, dx))
++  let difference = maxDifference(rolled(out, 2 * dy, 2 * dx), shifted, top: 0, left: 0)
++  check(
++    difference < 1e-3,
++    "Decoder with wrap \(value) (specializingNames \(specializingNames)) commutes with the shift"
++      + " (\(difference))")
++  let plainOut = runModel(plain, latent)
++  let plainShifted = runModel(plain, rolled(latent, dy, dx))
++  let plainDifference = maxDifference(
++    rolled(plainOut, 2 * dy, 2 * dx), plainShifted, top: 0, left: 0)
++  check(
++    plainDifference > 1e-2,
++    "the plain Decoder does not commute with the shift (\(plainDifference))")
++}
++
+ print("SeamlessTileTest: all passed")
+ 
+ // MARK: Frozen copies of the formulas as they were before the seamless parameter.
+diff --git a/Libraries/SwiftDiffusion/Sources/Models/Autoencoder.swift b/Libraries/SwiftDiffusion/Sources/Models/Autoencoder.swift
+index dfd57a1..4c8e8d6 100644
+--- a/Libraries/SwiftDiffusion/Sources/Models/Autoencoder.swift
++++ b/Libraries/SwiftDiffusion/Sources/Models/Autoencoder.swift
+@@ -3,8 +3,12 @@ import NNC
+ 
+ /// Autoencoder
+ 
++/// `wrap` pads the two 3x3 convolutions circularly (see `WrappingConvolution`); `inputShape` is the
++/// block's NHWC input and matters only with `wrap`.
+ private func NHWCResnetBlock(
+-  prefix: (String, String), outChannels: Int, shortcut: Bool, specializingNames: Bool
++  prefix: (String, String), outChannels: Int, shortcut: Bool, specializingNames: Bool,
++  wrap: SeamlessTile? = nil,
++  inputShape: (batchSize: Int, height: Int, width: Int, channels: Int) = (0, 0, 0, 0)
+ )
+   -> (Model, PythonReader, ModelWeightMapper)
+ {
+@@ -14,21 +18,22 @@ private func NHWCResnetBlock(
+     name: specializingNames ? "resnet_norm1" : "")
+   var out = norm1(x)
+   out = out.swish()
+-  let conv1 = Convolution(
++  let (conv1, applyConv1) = WrappingConvolution(
+     groups: 1, filters: outChannels, filterSize: [3, 3],
+-    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])), format: .OIHW,
+-    name: specializingNames ? "resnet_conv1" : "")
+-  out = conv1(out)
++    border: Hint.Border(begin: [1, 1], end: [1, 1]), wrap: wrap, inputShape: inputShape,
++    format: .OIHW, name: specializingNames ? "resnet_conv1" : "")
++  out = applyConv1(out)
+   let norm2 = GroupNorm(
+     axis: 3, groups: 32, epsilon: 1e-6, reduce: [1, 2],
+     name: specializingNames ? "resnet_norm2" : "")
+   out = norm2(out)
+   out = out.swish()
+-  let conv2 = Convolution(
++  let (conv2, applyConv2) = WrappingConvolution(
+     groups: 1, filters: outChannels, filterSize: [3, 3],
+-    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])), format: .OIHW,
+-    name: specializingNames ? "resnet_conv2" : "")
+-  out = conv2(out)
++    border: Hint.Border(begin: [1, 1], end: [1, 1]), wrap: wrap,
++    inputShape: (inputShape.batchSize, inputShape.height, inputShape.width, outChannels),
++    format: .OIHW, name: specializingNames ? "resnet_conv2" : "")
++  out = applyConv2(out)
+   let ninShortcut: Model?
+   if shortcut {
+     let nin = Convolution(
+@@ -453,7 +458,7 @@ private func NHWCEncoder(
+ private func NHWCDecoder(
+   channels: [Int], numRepeat: Int, batchSize: Int, startWidth: Int, startHeight: Int,
+   inputChannels: Int, highPrecisionKeysAndValues: Bool, usesFlashAttention: Bool,
+-  paddingFinalConvLayer: Bool, quantLayer: Bool, specializingNames: Bool
++  paddingFinalConvLayer: Bool, quantLayer: Bool, specializingNames: Bool, wrap: SeamlessTile?
+ )
+   -> (Model, PythonReader, ModelWeightMapper)
+ {
+@@ -471,14 +476,18 @@ private func NHWCDecoder(
+     postQuantConv2d = nil
+   }
+   var previousChannel = channels[channels.count - 1]
+-  let convIn = Convolution(
++  var height = startHeight
++  var width = startWidth
++  let (convIn, applyConvIn) = WrappingConvolution(
+     groups: 1, filters: previousChannel, filterSize: [3, 3],
+-    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])), format: .OIHW,
++    border: Hint.Border(begin: [1, 1], end: [1, 1]), wrap: wrap,
++    inputShape: (batchSize, height, width, inputChannels), format: .OIHW,
+     name: specializingNames ? "conv_in" : "")
+-  out = convIn(out)
++  out = applyConvIn(out)
+   let (midBlock1, midBlockReader1, midBlockMapper1) = NHWCResnetBlock(
+     prefix: ("decoder.mid.block_1", "decoder.mid_block.resnets.0"), outChannels: previousChannel,
+-    shortcut: false, specializingNames: specializingNames)
++    shortcut: false, specializingNames: specializingNames, wrap: wrap,
++    inputShape: (batchSize, height, width, previousChannel))
+   out = midBlock1(out)
+   let (midAttn1, midAttnReader1, midAttnMapper1) = NHWCAttnBlock(
+     prefix: ("decoder.mid.attn_1", "decoder.mid_block.attentions.0"), inChannels: previousChannel,
+@@ -488,7 +497,8 @@ private func NHWCDecoder(
+   out = midAttn1(out)
+   let (midBlock2, midBlockReader2, midBlockMapper2) = NHWCResnetBlock(
+     prefix: ("decoder.mid.block_2", "decoder.mid_block.resnets.1"), outChannels: previousChannel,
+-    shortcut: false, specializingNames: specializingNames)
++    shortcut: false, specializingNames: specializingNames, wrap: wrap,
++    inputShape: (batchSize, height, width, previousChannel))
+   out = midBlock2(out)
+   var readers = [PythonReader]()
+   var mappers = [ModelWeightMapper]()
+@@ -498,7 +508,8 @@ private func NHWCDecoder(
+         prefix: (
+           "decoder.up.\(i).block.\(j)", "decoder.up_blocks.\(channels.count - 1 - i).resnets.\(j)"
+         ), outChannels: channel,
+-        shortcut: previousChannel != channel, specializingNames: specializingNames)
++        shortcut: previousChannel != channel, specializingNames: specializingNames, wrap: wrap,
++        inputShape: (batchSize, height, width, previousChannel))
+       readers.append(reader)
+       mappers.append(mapper)
+       out = block(out)
+@@ -506,11 +517,14 @@ private func NHWCDecoder(
+     }
+     if i > 0 {
+       out = Upsample(.nearest, widthScale: 2, heightScale: 2)(out)
+-      let conv2d = Convolution(
++      height *= 2
++      width *= 2
++      let (conv2d, applyConv2d) = WrappingConvolution(
+         groups: 1, filters: channel, filterSize: [3, 3],
+-        hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])), format: .OIHW,
++        border: Hint.Border(begin: [1, 1], end: [1, 1]), wrap: wrap,
++        inputShape: (batchSize, height, width, channel), format: .OIHW,
+         name: specializingNames ? "upsample" : "")
+-      out = conv2d(out)
++      out = applyConv2d(out)
+       let upLayer = i
+       let reader: PythonReader = { stateDict, archive in
+         guard
+@@ -554,11 +568,12 @@ private func NHWCDecoder(
+     axis: 3, groups: 32, epsilon: 1e-6, reduce: [1, 2], name: specializingNames ? "norm_out" : "")
+   out = normOut(out)
+   out = out.swish()
+-  let convOut = Convolution(
++  let (convOut, applyConvOut) = WrappingConvolution(
+     groups: 1, filters: paddingFinalConvLayer ? 4 : 3, filterSize: [3, 3],
+-    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])), format: .OIHW,
++    border: Hint.Border(begin: [1, 1], end: [1, 1]), wrap: wrap,
++    inputShape: (batchSize, height, width, previousChannel), format: .OIHW,
+     name: specializingNames ? "conv_out" : "")
+-  out = convOut(out)
++  out = applyConvOut(out)
+   let reader: PythonReader = { stateDict, archive in
+     if let postQuantConv2d = postQuantConv2d {
+       guard let post_quant_conv_weight = stateDict["first_stage_model.post_quant_conv.weight"]
+@@ -1303,7 +1318,7 @@ public func Decoder(
+   channels: [Int], numRepeat: Int, batchSize: Int, startWidth: Int, startHeight: Int,
+   inputChannels: Int, highPrecisionKeysAndValues: Bool, usesFlashAttention: Bool,
+   paddingFinalConvLayer: Bool, format: TensorFormat, quantLayer: Bool = true,
+-  specializingNames: Bool = false
++  specializingNames: Bool = false, wrap: SeamlessTile? = nil
+ )
+   -> (Model, PythonReader, ModelWeightMapper)
+ {
+@@ -1314,8 +1329,10 @@ public func Decoder(
+       startHeight: startHeight, inputChannels: inputChannels,
+       highPrecisionKeysAndValues: highPrecisionKeysAndValues,
+       usesFlashAttention: usesFlashAttention, paddingFinalConvLayer: paddingFinalConvLayer,
+-      quantLayer: quantLayer, specializingNames: specializingNames)
++      quantLayer: quantLayer, specializingNames: specializingNames, wrap: wrap)
+   case .NCHW:
++    // Wrap padding is NHWC only: a seamless decode builds the NHWC decoder.
++    precondition(wrap == nil, "Decoder: wrap needs the NHWC format")
+     return NCHWDecoder(
+       channels: channels, numRepeat: numRepeat, batchSize: batchSize, startWidth: startWidth,
+       startHeight: startHeight, inputChannels: inputChannels,
+diff --git a/Libraries/SwiftDiffusion/Sources/SeamlessTile.swift b/Libraries/SwiftDiffusion/Sources/SeamlessTile.swift
+index 30239e9..0565e10 100644
+--- a/Libraries/SwiftDiffusion/Sources/SeamlessTile.swift
++++ b/Libraries/SwiftDiffusion/Sources/SeamlessTile.swift
+@@ -1,4 +1,5 @@
+ import Foundation
++import NNC
+ 
+ /// Seamless tile: the image repeats with no edge along the axes it wraps. The request carries it as
+ /// `GenerationConfiguration.seamlessTile` (0 off, 1 left-right, 2 up-down, 3 both).
+@@ -53,3 +54,80 @@ public func torusAngle(position: Double, omega: Double, period: Double, minTurns
+   if wrapped < 0 { wrapped += period }
+   return wrapped * torusFrequency(omega: omega, period: period, minTurns: minTurns)
+ }
++
++/// Circular padding in NHWC: the last `top` rows go above the first and the first `top` rows below
++/// the last (and the same with `left` for the columns), only on the axes that wrap. The input is
++/// `batchSize`x`height`x`width`x`channels`; the output grows by `2 * top` rows and `2 * left`
++/// columns on the wrapped axes. Slices need the shape, so the caller gives it.
++public func WrapPad(
++  batchSize: Int, height: Int, width: Int, channels: Int, top: Int, left: Int,
++  wrapsHeight: Bool, wrapsWidth: Bool
++) -> Model {
++  let x = Input()
++  var out: Model.IO = x
++  var height = height
++  if wrapsHeight && top > 0 {
++    precondition(top <= height, "WrapPad: \(top) rows from a height of \(height)")
++    let strides: TensorShape = [height * width * channels, width * channels, channels, 1]
++    let last = out.reshaped(
++      [batchSize, top, width, channels], offset: [0, height - top, 0, 0], strides: strides
++    ).contiguous()
++    let first = out.reshaped(
++      [batchSize, top, width, channels], offset: [0, 0, 0, 0], strides: strides
++    ).contiguous()
++    out = Functional.concat(axis: 1, last, out, first)
++    height += 2 * top
++  }
++  if wrapsWidth && left > 0 {
++    precondition(left <= width, "WrapPad: \(left) columns from a width of \(width)")
++    let strides: TensorShape = [height * width * channels, width * channels, channels, 1]
++    let last = out.reshaped(
++      [batchSize, height, left, channels], offset: [0, 0, width - left, 0], strides: strides
++    ).contiguous()
++    let first = out.reshaped(
++      [batchSize, height, left, channels], offset: [0, 0, 0, 0], strides: strides
++    ).contiguous()
++    out = Functional.concat(axis: 2, last, out, first)
++  }
++  return Model([x], [out])
++}
++
++/// A stride-1 convolution on an NHWC input of `inputShape` that pads circularly on the axes `wrap`
++/// wraps. With `wrap == nil` it is exactly `Convolution(..., hint: Hint(stride: [1, 1], border:
++/// border), ...)`, so the weights keep their names. Otherwise the input goes through `WrapPad` by
++/// the border on each wrapped axis (begin and end must match there) and the convolution's border
++/// on that axis becomes 0; the other axis keeps its border. Returns the convolution (for its
++/// weights) and the function that applies it.
++public func WrappingConvolution(
++  groups: Int, filters: Int, filterSize: [Int], border: Hint.Border, wrap: SeamlessTile?,
++  inputShape: (batchSize: Int, height: Int, width: Int, channels: Int),
++  format: Convolution.Format, name: String = ""
++) -> (Convolution, (Model.IO) -> Model.IO) {
++  guard let wrap = wrap else {
++    let conv = Convolution(
++      groups: groups, filters: filters, filterSize: filterSize,
++      hint: Hint(stride: [1, 1], border: border), format: format, name: name)
++    return (conv, { conv($0) })
++  }
++  let begin = border.begin.count == 2 ? border.begin : [0, 0]
++  let end = border.end.count == 2 ? border.end : [0, 0]
++  let wrapsHeight = wrap.wrapsHeight && (begin[0] > 0 || end[0] > 0)
++  let wrapsWidth = wrap.wrapsWidth && (begin[1] > 0 || end[1] > 0)
++  precondition(!wrapsHeight || begin[0] == end[0], "WrappingConvolution: uneven height border")
++  precondition(!wrapsWidth || begin[1] == end[1], "WrappingConvolution: uneven width border")
++  let conv = Convolution(
++    groups: groups, filters: filters, filterSize: filterSize,
++    hint: Hint(
++      stride: [1, 1],
++      border: Hint.Border(
++        begin: [wrapsHeight ? 0 : begin[0], wrapsWidth ? 0 : begin[1]],
++        end: [wrapsHeight ? 0 : end[0], wrapsWidth ? 0 : end[1]])), format: format, name: name)
++  guard wrapsHeight || wrapsWidth else {
++    return (conv, { conv($0) })
++  }
++  let pad = WrapPad(
++    batchSize: inputShape.batchSize, height: inputShape.height, width: inputShape.width,
++    channels: inputShape.channels, top: begin[0], left: begin[1], wrapsHeight: wrapsHeight,
++    wrapsWidth: wrapsWidth)
++  return (conv, { conv(pad($0)) })
++}
+-- 
+2.54.0 (Apple Git-157)
+
